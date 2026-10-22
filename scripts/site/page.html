@@ -1,0 +1,336 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Dave: agents, loops and a clock, written once in Temper</title>
+<meta name="description" content="Reference for the Dave Temper library and how Jam Pilot uses it: the chat types, the rounds engine, the repair and compose loops, the generic agent with tool buckets, and the classroom clock. Real source on every block; live demos run the JavaScript translation.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Syne:wght@700;800&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;1,400&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+{{css}}
+</style>
+</head>
+<body>
+<div class="shell">
+<aside class="side"><div class="side-inner">
+  <a class="brand" href="#top">Dave<small>Temper · one source · seven backends</small></a>
+  <nav class="toc" aria-label="Sections">
+    <a href="#top">Overview</a>
+    <a href="#host">Into a host</a>
+    <a href="#chat">Chat types</a>
+    <a class="sub" href="#chat-stream">Streaming</a>
+    <a href="#rounds">The engine</a>
+    <a class="sub" href="#rounds-tools">Tool turns</a>
+    <a class="sub" href="#rounds-host">The host loop</a>
+    <a href="#repair">Repair</a>
+    <a href="#compose">Compose</a>
+    <a href="#agent">Generic agent</a>
+    <a href="#room">The room</a>
+    <a class="sub" href="#room-server">Server side</a>
+    <a class="sub" href="#room-pages">Page side</a>
+    <a href="#tests">Tests and backends</a>
+  </nav>
+  <div class="matrix-mini">
+    <span>interp <b>70/70</b></span><span>js <b>70/70</b></span><span>py <b>70/70</b></span><span>lua <b>70/70</b></span>
+    <span>rust <b>70/70</b></span><span>csharp <b>70/70</b></span><span>elixir <b>70/70</b></span><span>java <i>no run</i></span>
+  </div>
+</div></aside>
+
+<main><article>
+
+<section id="top">
+  <header>
+    <div class="eyebrow">Dave · a Temper library</div>
+    <h1>Agents, loops and a classroom clock, written once.</h1>
+    <p>Dave is the library under Jam Pilot, a Phoenix app for school music lessons. It holds the OpenAI-style chat types, an engine that asks a model and lets the host check the answer, the two loops Jam Pilot runs on it (score repair and a composer's assistant), a generic agent with a pluggable specialty and tool buckets, and the clock that keeps a TV and thirty iPads on the same beat. It is written once in <a href="https://temperlang.dev">Temper</a> and translated to C#, Java, JavaScript, Lua, Python, Rust and Elixir. Jam Pilot runs the Elixir translation on its server and the JavaScript one in every browser.</p>
+    <p>Every code block on this page is cut from a real file by the build script, library and host alike. The demos run the library's own JavaScript build in this browser with scripted model replies: no model is called, every step is real.</p>
+  </header>
+  <div class="tablewrap"><table class="matrix">
+    <thead><tr><th>backend</th><th>interp</th><th>js</th><th>py</th><th>lua</th><th>rust</th><th>csharp</th><th>elixir</th><th>java</th></tr></thead>
+    <tbody><tr><td>tests</td><td>70/70</td><td>70/70</td><td>70/70</td><td>70/70</td><td>70/70</td><td>70/70</td><td>70/70</td><td class="off">no run</td></tr></tbody>
+  </table></div>
+  <p class="small muted">The same seventy tests, extracted into each backend's own framework. Java does not run on the build machine: the CLI rejects Homebrew's JDK version string.</p>
+  <div class="sub">
+    <h3>The library root</h3>
+    <p>A Temper library is a directory of modules; the root names them. All of Dave is six modules.</p>
+    {{snippet:config}}
+    <h3>The rules the code is held to</h3>
+    {{snippet:rules}}
+  </div>
+</section>
+
+<section id="host">
+  <header>
+    <div class="eyebrow">Into a host</div>
+    <h2>Vendored, not depended on.</h2>
+    <p>Jam Pilot takes the generated code by copying it in, because its deploy rsyncs one checkout to the box and the Dockerfile builds from that. One script builds both translations and copies them: Elixir into <code>vendor/dave</code>, where <code>mix.exs</code> lists three path dependencies, and JavaScript into <code>assets/vendor/temper</code>, where esbuild aliases resolve <code>import … from "dave/room"</code>.</p>
+  </header>
+  {{snippet:vendor_header}}
+  {{snippet:vendor_js}}
+  <div class="cols">
+    {{snippet:mix_deps}}
+    {{snippet:dockerfile}}
+  </div>
+  {{snippet:esbuild}}
+  <p>The VERSION file records what was built, so a box can be asked which library it runs:</p>
+  {{snippet:version}}
+</section>
+
+<section id="chat">
+  <header>
+    <div class="eyebrow">src/chat</div>
+    <h2>The wire format, with the network left to the host.</h2>
+    <p>The chat completions format is the OpenAI one because every other provider speaks it. Messages are a sealed type, a tool call keeps the model's arguments as the JSON text it produced, and a request carries an <code>extra</code> map merged into the top-level object as given, which is how a host sends <code>reasoning_effort</code>. The one interface the host implements is <code>Transport</code>: one synchronous method, and a 4xx or 5xx is a response, not a failure.</p>
+  </header>
+  {{snippet:transport}}
+  {{snippet:client}}
+  <div class="sub">
+    <h3>Messages</h3>
+    <p>A sealed interface translates to a sum type: a Rust enum, a C# class hierarchy, a <code>when</code> in Temper. A host never meets a bag of nullable fields that only make sense in some roles.</p>
+    {{snippet:messages}}
+    {{snippet:toolcall}}
+  </div>
+  <div class="sub">
+    <h3>Problems</h3>
+    <p>Temper's <code>Bubble</code> carries no message, so a decoder that cannot accept its input records why, with the JSON path, before it bubbles. Nothing is defaulted silently.</p>
+    {{snippet:problems}}
+  </div>
+  <div class="sub" id="chat-stream">
+    <h3>Streaming</h3>
+    <p>The assembler takes frames, not lines, because a socket read ends wherever it ends: the unfinished last line waits in a buffer for the next frame. <code>finish()</code> builds the same <code>ChatResponse</code> a whole reply gives, usage included. This replaced Jam Pilot's hand-written SSE parser; a malformed data line is now a problem that bubbles, not a line that is skipped.</p>
+    {{snippet:stream_head}}
+    <p>Jam Pilot's composer streams, so its host side feeds the assembler from the process that made it (Temper fields live in the process dictionary) and forwards each delta to the page as it arrives:</p>
+    {{snippet:stream_host}}
+    {{snippet:glm_stream}}
+    <div class="demo">
+      <div class="cap"><b>Demo · StreamAssembler</b><span>Fireworks-shaped frames, the third cut mid-line</span></div>
+      <div class="body">
+        <div class="controls">
+          <div class="buttons"><button id="stream-play">Stream a reply</button><button class="quiet" id="stream-clear">Clear</button></div>
+          <div class="frames" id="stream-frames"></div>
+          <p class="hint">The final chunk carries the usage, so the response knows how many tokens went to thinking.</p>
+        </div>
+        <div class="out">
+          <div class="reply" id="stream-reply"><div class="eyebrow">What the page shows</div><div class="thinking"></div><div class="content"></div></div>
+          <div class="eyebrow">finish()</div>
+          <pre id="stream-finish" class="mono" style="margin:0;font-size:0.78rem;white-space:pre-wrap">(not finished)</pre>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="rounds">
+  <header>
+    <div class="eyebrow">src/rounds</div>
+    <h2>The engine: ask, read, check, send the problems back.</h2>
+    <p>A rounds loop asks a model for something, reads the reply into a candidate, has the host check it, sends the problems back, and stops after N rounds. The host asks <code>next(event)</code> and performs the step it gets. These two sealed types are the whole vocabulary between the library and a host:</p>
+  </header>
+  {{snippet:steps}}
+  <p>What differs between loops is plugged in, and nothing else is: a policy, a script (the turns the model hears and the sentences the record keeps) and a reader (the reply as a proposal, the proposal as the text to check).</p>
+  {{snippet:policy}}
+  <p>The engine's <code>next</code> is a <code>when</code> over the event. A <code>CheckPassed</code> with no <code>Check</code> outstanding is the host's bug and panics.</p>
+  {{snippet:next}}
+  <div class="sub" id="rounds-tools">
+    <h3>Tool turns</h3>
+    <p>A loop may offer tools, in buckets. A reply that calls them is a <code>RunTools</code> step inside the round; the host's results come back as tool messages, in the calls' order whatever order the host reported them in, and the model is asked again. After the round's budget of tool turns the tools are closed with <code>tool_choice: "none"</code> and a turn asking for the answer. A call to a tool in no offered bucket never reaches the host.</p>
+    {{snippet:buckets}}
+    {{snippet:tool_turn}}
+    <p>Every round leaves an <code>Attempt</code>, tool calls counted:</p>
+    {{snippet:attempt}}
+  </div>
+  <div class="sub" id="rounds-host">
+    <h3>The host loop, in Elixir</h3>
+    <p>A Temper object in Elixir is a <code>%TemperCore.Ref{class: Module}</code> whose fields live in the process dictionary, so the loop is one function clause per step, matched on the class, and the whole loop runs in one process. This is Jam Pilot's repair loop as it runs in production:</p>
+    {{snippet:hotfix_drive}}
+    <div class="demo">
+      <div class="cap"><b>Demo · RepairAgent on the engine</b><span>scripted model, real steps</span></div>
+      <div class="body">
+        <div class="controls">
+          <label class="row"><span>Scenario</span>
+            <select id="engine-scenario">
+              <option value="first">Reads first time</option>
+              <option value="three">Three rounds to get it right</option>
+              <option value="cutoff">Cut off, asked again at low effort</option>
+              <option value="dead">Model unreachable</option>
+            </select></label>
+          <div class="buttons"><button id="engine-play">Play</button><button class="quiet" id="engine-clear">Clear</button></div>
+          <div class="eyebrow">The refused score</div>
+          <pre id="engine-doc" class="mono" style="margin:0;font-size:0.76rem;white-space:pre-wrap"></pre>
+          <p class="hint">The host's reader refuses any score still holding <code>&lt;value&gt;3&lt;/value&gt;</code>, with the sentence Jam Pilot's reader uses.</p>
+        </div>
+        <div class="out"><div class="trace" id="engine-trace"><div class="legend"><b class="l">library</b><b class="h">host</b></div></div></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="repair">
+  <header>
+    <div class="eyebrow">src/repair</div>
+    <h2>Repair: the smallest edits that make the reader take the score.</h2>
+    <p>When Jam Pilot's strict reader refuses an imported score, the model is asked for find/replace edits, three rounds at most, a cut-off retried once at low effort, a reviewer's note as a tie-breaker on retry. The turns are byte for byte what the host sent before the engine existed, because every error sentence goes back to the model as its next turn and was tuned against it.</p>
+  </header>
+  {{snippet:edits_contract}}
+  {{snippet:repair_agent}}
+  <p>The reader applies the edits to the original document; the script is the words that go back:</p>
+  {{snippet:repair_script}}
+  {{snippet:repair_turn}}
+  <div class="sub">
+    <h3>In Jam Pilot</h3>
+    <p>The host builds the setup, drives the loop (the clauses above) and reads the attempts back into the maps the issue row keeps. A teacher's retry note becomes <code>Guidance</code>, with the attempts they rejected rebuilt from the row.</p>
+    {{snippet:hotfix_repair}}
+    {{snippet:hotfix_guidance}}
+    <p class="inline-note">The generated Elixir has only the full-arity constructor, which is why <code>previous_attempt/1</code> passes the trailing <code>toolCalls</code> explicitly: when <code>Attempt</code> gained that field, <code>Attempt.new/5</code> stopped existing and three app tests failed until this line passed a sixth argument.</p>
+    <h3>The three-round conversation, as the test keeps it</h3>
+    {{snippet:repair_test}}
+  </div>
+</section>
+
+<section id="compose">
+  <header>
+    <div class="eyebrow">src/compose</div>
+    <h2>Compose: a whole song back, five rounds, the draft kept.</h2>
+    <p>A teacher types a song as text and asks the bot in plain words. The reply is a <code>Summary:</code> line and the whole song in a fence. The host's reader checks what comes back, then its word list; a song that does not read goes back with the reader's own sentences. The last song that read is the draft: when the rounds run out it is handed back anyway, problems and all. The effort schedule is a measurement: at <code>"medium"</code> and 8,000 tokens the model thought through all 8,000 and never answered.</p>
+  </header>
+  {{snippet:compose_agent}}
+  {{snippet:compose_outcome}}
+  {{snippet:compose_script}}
+  <p>The reply parser is the host's two PCRE regexes written out by hand, backtracking included, because Temper's regex has no <code>/s</code>, <code>/i</code> or <code>/m</code>:</p>
+  {{snippet:reply_header}}
+  <div class="sub">
+    <h3>In Jam Pilot</h3>
+    {{snippet:compose_assist}}
+    {{snippet:compose_drive}}
+  </div>
+</section>
+
+<section id="agent">
+  <header>
+    <div class="eyebrow">src/agent</div>
+    <h2>The generic agent: a specialty in code, the host's tools in buckets.</h2>
+    <p><code>RepairAgent</code> and <code>ComposeAgent</code> are each one specialty written out by hand. A <code>Specialty</code> is that bundle as an interface: name and system prompt required, the opening turn, policy, script and reader defaulted, plus the names of the tool buckets the agent may use. <code>GenericAgent</code> wires one to the engine with those buckets picked out of the host's catalogue, and panics on <code>next</code> if the catalogue lacks one.</p>
+  </header>
+  {{snippet:specialty}}
+  {{snippet:generic_agent}}
+  <div class="sub">
+    <h3>A specialty, and what the engine does with it</h3>
+    <p>The librarian from the library's tests, and two of the eleven tests that drive it through the step machine:</p>
+    {{snippet:librarian}}
+    {{snippet:agent_test_turn}}
+    {{snippet:agent_test_closed}}
+    <h3>From JavaScript</h3>
+    <p>The same agent driven from Node against the built bundle. A missing argument takes the Temper default.</p>
+    {{snippet:quickstart}}
+    <div class="demo">
+      <div class="cap"><b>Demo · GenericAgent</b><span>the librarian, two buckets in the catalogue, one offered</span></div>
+      <div class="body">
+        <div class="controls">
+          <label class="row"><span>Tool turns per round</span>
+            <select id="agent-turns"><option value="8">8 (default)</option><option value="2" selected>2</option><option value="1">1</option></select></label>
+          <label class="row"><span>Model also calls <code>boil</code></span><input type="checkbox" id="agent-unknown" checked></label>
+          <label class="row"><span>Model obeys <code>tool_choice: none</code></span><input type="checkbox" id="agent-obeys" checked></label>
+          <label class="row"><span>Host refuses the first answer</span><input type="checkbox" id="agent-refuse"></label>
+          <label class="row"><span>Catalogue lacks <code>shelf</code></span><input type="checkbox" id="agent-missing"></label>
+          <div class="buttons"><button id="agent-play">Play</button><button class="quiet" id="agent-clear">Clear</button></div>
+          <p class="hint">The scripted model looks two titles up, then answers with the shelf mark. With one tool turn per round, the second lookup comes after the tools were closed.</p>
+        </div>
+        <div class="out"><div class="trace" id="agent-trace"><div class="legend"><b class="l">library</b><b class="h">host</b></div></div></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="room">
+  <header>
+    <div class="eyebrow">src/room</div>
+    <h2>The room: one clock on the server, a follower on every screen.</h2>
+    <p>The classroom plays from a TV while every child follows on an iPad. The server holds one clock per score; each page keeps a follower that reads the broadcasts through its own estimated offset. A play can hold at the top of a bar for the count-in, and the words "1, 2, ready, play" come from the bar's length. Nothing here reads a clock: every method takes milliseconds from the host, so the Elixir server and the JavaScript pages run the same arithmetic. Before the port the formula lived twice, and the day the count-in shipped the two copies disagreed: the red line wobbled on every heartbeat.</p>
+  </header>
+  {{snippet:room_clock}}
+  {{snippet:server_offset}}
+  {{snippet:follower}}
+  {{snippet:count_in}}
+  <div class="sub" id="room-server">
+    <h3>Server side: the GenServer that owns the clocks</h3>
+    <p>Time, the broadcast and the heartbeat are the host's. Temper objects in Elixir live in the process dictionary and nothing frees them on its own, so the server collects the heap after every call with the live clocks as roots. The channel answers pings with its wall clock, which is all a follower needs.</p>
+    {{snippet:sessions}}
+    {{snippet:ping}}
+  </div>
+  <div class="sub" id="room-pages">
+    <h3>Page side: the same source as JavaScript</h3>
+    {{snippet:clock_js}}
+    {{snippet:count_in_js}}
+    <h3>The regression that started it</h3>
+    {{snippet:no_wobble}}
+    {{snippet:same_word}}
+    <div class="demo">
+      <div class="cap"><b>Demo · RoomClock and two followers</b><span>real wall time, simulated network</span></div>
+      <div class="room">
+        <div class="screen server">
+          <div class="name"><h3>Server</h3><span class="eyebrow">RoomClock</span></div>
+          <div class="pos" id="srv-pos">0:00.0</div>
+          <div class="buttons"><button id="room-play">Play</button><button class="quiet" id="room-pause">Pause</button><button class="quiet" id="room-seek">Back to the top</button></div>
+          <label class="row"><span>Count in a bar first</span><input type="checkbox" id="room-countin" checked></label>
+          <div class="meta"><span id="srv-state">paused at 0 ms</span><span>90 bpm · 4/4 · 8 bars · bar 2667 ms</span></div>
+        </div>
+        <div class="screen" id="scr-tv">
+          <div class="name"><h3>TV</h3><span class="eyebrow">FollowerClock · 10 ms ping</span></div>
+          <span class="jump">jumped</span>
+          <div class="word">&nbsp;</div>
+          <div class="pos">0:00.0</div>
+          <div class="bars"></div>
+          <div class="meta"><span class="offset">offset: not yet known</span><span class="last">no broadcast yet</span></div>
+        </div>
+        <div class="screen" id="scr-ipad">
+          <div class="name"><h3>iPad</h3><span class="eyebrow">clock +37 s · broadcasts 200 ms late</span></div>
+          <span class="jump">jumped</span>
+          <div class="word">&nbsp;</div>
+          <div class="pos">0:00.0</div>
+          <div class="bars"></div>
+          <div class="meta"><span class="offset">offset: not yet known</span><span class="last">no broadcast yet</span></div>
+        </div>
+      </div>
+    </div>
+    <p class="inline-note">Each follower keeps the five fastest of its ping samples and estimates <code>offset = serverNow + rtt/2 − received</code>. A broadcast that moves the position by more than 150 ms is reported as a jump, so a page can tell a heartbeat from a seek. The first broadcast always reads as one.</p>
+  </div>
+</section>
+
+<section id="tests">
+  <header>
+    <div class="eyebrow">Tests and backends</div>
+    <h2>Seventy tests, extracted into seven frameworks.</h2>
+    <p>Tests live beside the code as <code>test</code> blocks and each backend extracts them into its own framework: mocha, pytest, cargo test, MSTest, ExUnit. Every check runs inside a function that takes the <code>Test</code>, with inputs fed through a list, because the Temper frontend folds calls whose inputs are all literals and would otherwise test the compiler's interpreter instead of the generated code.</p>
+  </header>
+  {{snippet:test_pattern}}
+  <p>The matrix script runs the suite on every backend and writes the table; a backend that fails to run at all is "no run", never a pass.</p>
+  {{snippet:matrix_sh}}
+  {{snippet:matrix_md}}
+  <div class="sub">
+    <h3>What the backends taught</h3>
+    <ul>
+      <li>The C# backend turns an <code>if</code> used as a <code>when</code> arm into a dangling else; the Rust backend types <code>[new TextPart(x)]</code> as <code>Vec&lt;TextPart&gt;</code> where a <code>Vec&lt;ContentPart&gt;</code> is needed; the JS backend drops a std function from the extracted test file when the test file re-imports it. Each has a kept probe under <code>probes/</code>.</li>
+      <li>A field named <code>finish</code> beside a method <code>finish()</code> reads as the method on interp and as the field on js and py; the assembler's field is <code>finishSeen</code>.</li>
+      <li>The Elixir backend puts every class of every module into one namespace, test helpers included, and the last one wins: two test files each declaring <code>class Run</code> pass on six backends and fail on Elixir with <code>Run.new/3 is undefined</code>. Helpers carry their module's name.</li>
+      <li>The Elixir backend emits only the full-arity constructor, so host call sites pass every argument, defaults included.</li>
+      <li>Float64 division can bubble, so a non-throwing function multiplies by <code>0.5</code> or writes <code>orelse panic()</code>; the Elixir CLI rejects a <code>for..of</code> that reassigns an outer variable, so the room uses indexed loops.</li>
+    </ul>
+  </div>
+  <footer>
+    <span>Dave is developed beside Jam Pilot. The README is the front door; <code>docs/jam-pilot-port.md</code> is the record of the first host. This page is generated by <code>scripts/site/build.py</code> from the sources shown, and <code>scripts/site.sh</code> rebuilds its bundle.</span>
+  </footer>
+</section>
+
+</article></main>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/elixir.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/dockerfile.min.js"></script>
+<script src="dave.js"></script>
+<script>
+{{js}}
+</script>
+</body>
+</html>

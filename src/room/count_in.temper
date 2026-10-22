@@ -1,0 +1,99 @@
+// The count-in: "1, 2, ready, play", and the song starts on the next beat.
+//
+// Dave starts a piece by saying those words out loud and the room comes in
+// after "play". So a play from the TV asks the room clock to hold at the
+// start of the bar for a count first, and every screen shows the words
+// from that same clock: an iPad counts with the TV, and one that joins
+// halfway through the count shows the right word.
+//
+// The count is one full bar at the bar's tempo, less the bar itself when it
+// is short (a pickup), so the first downbeat still lands on a "one": A Ram
+// Sam Sam's one-beat pickup at 120 gets "1, ready, play", then the pickup.
+// A three-beat count is "1, ready, play", four is "1, 2, ready, play".
+//
+// Ported from Jam Pilot's assets/js/count_in.js. The host hands in a
+// `RoomTimeline`: the bars in score order with their real and full
+// lengths, and the bars in play order (repeats unrolled) with their
+// starts. Jam Pilot's timeline JSON carries both; a host with only the
+// score order passes it as the playback too.
+
+// One bar of the score. `ms` is its real length (a pickup is short);
+// `fullMs` is a whole bar at this bar's tempo.
+export class Bar(
+  public index: Int,
+  // where the bar starts the first time it is played
+  public startMs: Float64,
+  public ms: Float64,
+  public fullMs: Float64,
+) {}
+
+// One bar in play order, with its start on the clock.
+export class PlaybackStep(public bar: Int, public startMs: Float64) {}
+
+export class RoomTimeline(
+  // beats per bar, from the time signature
+  public beats: Int,
+  public measures: List<Bar>,
+  public playback: List<PlaybackStep>,
+) {}
+
+// The count before the bar being started at `positionMs`: where that bar
+// starts (a resume mid-bar goes back to the top of it), how long the count
+// is, one beat's length, and the words.
+export class CountIn(
+  public startMs: Float64,
+  public ms: Float64,
+  public beatMs: Float64,
+  public words: List<String>,
+) {}
+
+// What a screen shows right now: the word for this beat, which beat it is
+// (0-based) and how many there are.
+export class CountInBeat(public word: String, public index: Int, public count: Int) {}
+
+// The playback step (bar, in play order) that contains `positionMs`: the
+// last one that starts at or before it, or the first when the position is
+// before every start.
+export let stepAt(timeline: RoomTimeline, positionMs: Float64): PlaybackStep {
+  // an indexed loop, not for..of: the Elixir CLI (../temper-elixir, behind
+  // upstream) stops at "Never reached by macro expander" on a for..of that
+  // reassigns an outer var holding an object; the other backends take it
+  var at = timeline.playback[0];
+  for (var i = 0; i < timeline.playback.length; i += 1) {
+    let s = timeline.playback[i];
+    if (s.startMs <= positionMs) { at = s; }
+  }
+  at
+}
+
+export let countInFor(timeline: RoomTimeline, positionMs: Float64): CountIn {
+  let step = stepAt(timeline, positionMs);
+  let bar = timeline.measures[step.bar];
+  let ms = if (bar.ms < bar.fullMs) { bar.fullMs - bar.ms } else { bar.fullMs };
+  let beatMs = (bar.fullMs / timeline.beats.toFloat64()) orelse panic();
+  // a timeline with no beats, or a bar with no length, is a host bug
+  let n = (ms / beatMs).round().toInt32() orelse panic();
+  new CountIn(step.startMs, ms.round(), beatMs, countInWords(n))
+}
+
+// The words for an n-beat count: the numbers up to n - 2, then "ready",
+// then "play". One beat is just "play"; none is silence.
+export let countInWords(n: Int): List<String> {
+  let out = new ListBuilder<String>();
+  for (var i = 1; i <= n - 2; i += 1) { out.add(i.toString()); }
+  if (n >= 2) { out.add("ready"); }
+  if (n >= 1) { out.add("play"); }
+  out.toList()
+}
+
+// What the screen shows with `leftMs` of the count still to run; null once
+// the song is going (or paused), or when the count has no words.
+export let countInNow(timeline: RoomTimeline, positionMs: Float64, leftMs: Float64): CountInBeat? {
+  if (!(leftMs > 0.0)) { return null; }
+  let count = countInFor(timeline, positionMs);
+  let words = count.words;
+  if (words.isEmpty) { return null; }
+  let beatsLeft = ((leftMs / count.beatMs).ceil().toInt32() orelse panic()).max(1).min(words.length);
+  let index = words.length - beatsLeft;
+  new CountInBeat(words[index], index, words.length)
+}

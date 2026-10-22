@@ -1,0 +1,147 @@
+// A generic agent: the rounds engine with a specialty plugged in, and the
+// host's tools offered to the model in buckets.
+//
+// `RepairAgent` and `ComposeAgent` are each one specialty written out by
+// hand: a system prompt, an opening turn, a policy, a script, a reader. A
+// `Specialty` is that bundle as an interface the host (or this library)
+// implements in code, plus the names of the tool buckets the agent may
+// use. `GenericAgent` wires one to the engine with those buckets picked
+// out of the host's catalogue. The host loop is the same steps as ever,
+// `SendRequest`, `Check`, `Done`, `GaveUp`, plus `RunTools`: run each
+// call's tool, report `ToolsRan`.
+//
+// The defaults make the smallest specialty two lines: a name and a system
+// prompt. Its task is the opening turn as given, its reply is read as the
+// answer itself, three rounds, and a reply the host's check refuses goes
+// back with the check's sentences. A specialty that wants a structured
+// reply overrides `reader`; one with its own words overrides `script`.
+
+// The chat and engine names are bound here for the whole module: the test
+// file (agent_test.temper) drives the steps and builds responses with
+// them, and a module's files share one scope.
+let { JsonSyntaxTree, parseJson } = import("std/json");
+let {
+  Problems, FunctionTool, Message, ChatRequest, ChatResponse, Choice, Usage, FinishReasons,
+  UserMessage, AssistantMessage, ToolMessage, ToolCall, NoToolChoice,
+} = import("../chat");
+let {
+  RoundsAgent, RoundsPolicy, Script, ReplyReader, Proposal, Attempt, Draft, Step, Event,
+  ToolBucket, ToolRun, ToolResult, GiveUpCauses,
+  Start, Responded, TransportFailed, CheckPassed, CheckRefused, ToolsRan,
+  SendRequest, Check, RunTools, Done, GaveUp,
+} = import("../rounds");
+
+export interface Specialty {
+  // a short name, for the host's logs and records
+  public get name(): String;
+  public get systemPrompt(): String;
+  // the buckets this specialty may use, by name; the host's catalogue has them
+  public get buckets(): List<String> { [] }
+  // the first user turn, from the task the host hands in
+  opening(task: String): String { task }
+  public get policy(): RoundsPolicy { plainPolicy(3, 8000, null) }
+  public get script(): Script { new PlainScript() }
+  public get reader(): ReplyReader { new PlainReader() }
+}
+
+// Rounds, max_tokens and one effort for every kind of round; a cut-off is
+// asked for again and a refused answer is kept as the draft.
+export let plainPolicy(rounds: Int, maxTokens: Int, effort: String?): RoundsPolicy {
+  new RoundsPolicy(rounds, 0.2, maxTokens, effort, effort, effort, true, true)
+}
+
+// The sentence for a reply the model cut off by thinking past max_tokens.
+export let plainCutOff(reasoningTokens: Int?, maxTokens: Int, beforeAnyAnswer: Boolean): String {
+  let count = if (reasoningTokens == null) { "?" } else { reasoningTokens.toString() };
+  let tail = if (beforeAnyAnswer) { " before any answer" } else { "" };
+  "the model ran out of room: ${count} of ${maxTokens} tokens went to thinking and the reply was cut off${tail}"
+}
+
+// Plain words for the turns that go back to the model.
+export class PlainScript extends Script {
+  public unreadableTurn(problems: List<String>): String {
+    "That reply could not be used: ${problems.join(" ") { it => it }} Answer again."
+  }
+  public refusedTurn(problems: List<String>): String {
+    "That answer was refused: ${problems.join(" ") { it => it }} Answer again."
+  }
+  public cutOffTurn(why: String): String { "${why}. Answer again, more briefly." }
+  public cutOffRecord(reasoningTokens: Int?, maxTokens: Int, beforeAnyAnswer: Boolean): String {
+    plainCutOff(reasoningTokens, maxTokens, beforeAnyAnswer)
+  }
+}
+
+// The reply is the answer. An empty one is not a reply.
+export class PlainReader extends ReplyReader {
+  public read(reply: String, problems: Problems): Proposal throws Bubble {
+    if (reply.isEmpty) {
+      problems.note("The reply was empty.");
+      bubble();
+    }
+    new Proposal("", [], reply)
+  }
+}
+
+// The buckets in `catalogue` whose names `wanted` lists, in the specialty's order.
+export let pickBuckets(wanted: List<String>, catalogue: List<ToolBucket>): List<ToolBucket> {
+  let out = new ListBuilder<ToolBucket>();
+  for (var i = 0; i < wanted.length; i += 1) {
+    for (var j = 0; j < catalogue.length; j += 1) {
+      if (catalogue[j].name == wanted[i]) { out.add(catalogue[j]); }
+    }
+  }
+  out.toList()
+}
+
+// The names in `wanted` that no bucket in `catalogue` has.
+export let missingBuckets(wanted: List<String>, catalogue: List<ToolBucket>): List<String> {
+  let out = new ListBuilder<String>();
+  for (var i = 0; i < wanted.length; i += 1) {
+    var found = false;
+    for (var j = 0; j < catalogue.length; j += 1) {
+      if (catalogue[j].name == wanted[i]) { found = true; }
+    }
+    if (!found) { out.add(wanted[i]); }
+  }
+  out.toList()
+}
+
+export class GenericAgent(
+  public model: String,
+  // what the agent is asked to do; the specialty's `opening` words it
+  public task: String,
+  public specialty: Specialty,
+  // the host's tool catalogue; only the specialty's buckets are offered
+  public catalogue: List<ToolBucket> = [],
+  // tool turns per round before the tools are closed and an answer asked for
+  public toolTurns: Int = 8,
+) {
+  private engine: RoundsAgent = new RoundsAgent(
+    model,
+    specialty.systemPrompt,
+    specialty.opening(task),
+    specialty.policy,
+    specialty.script,
+    specialty.reader,
+    pickBuckets(specialty.buckets, catalogue),
+    toolTurns,
+  );
+
+  // the buckets offered to the model
+  public get buckets(): List<ToolBucket> { pickBuckets(specialty.buckets, catalogue) }
+  // bucket names the specialty asked for that the catalogue does not have.
+  // An agent with any is misconfigured: `next` panics rather than run
+  // without tools the specialty was written for.
+  public get missing(): List<String> { missingBuckets(specialty.buckets, catalogue) }
+
+  public get history(): List<Message> { engine.history }
+  public get attemptsSoFar(): List<Attempt> { engine.attemptsSoFar }
+  public get currentRound(): Int { engine.currentRound }
+  public get draft(): Draft? { engine.draft }
+  public get lastProblems(): List<String> { engine.lastProblems }
+
+  public next(event: Event): Step {
+    if (!missing.isEmpty) { panic(); }
+    engine.next(event)
+  }
+}

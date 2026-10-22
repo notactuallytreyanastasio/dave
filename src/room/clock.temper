@@ -1,0 +1,186 @@
+// The room's clock: one source of "where are we in the song" for a TV and
+// a class full of iPads.
+//
+// Ported from Jam Pilot, where it lived twice: `Dave.Sessions` (Elixir,
+// the server) and `assets/js/clock.js` (the pages). The two copies had to
+// agree to the millisecond, and on 2026-10-21 they did not: the count-in
+// shipped, the server held the position for a bar, and an iPad still on
+// the old page kept running ahead and was snapped back by every
+// heartbeat. The red line wobbled. Here the formula exists once and both
+// hosts call it.
+//
+// The scheme. The server keeps, per score, `status`, `positionMs` (where
+// the song was when the status was set), `countInMs` (how long to hold
+// there first) and `atMs` (when, on the server's monotonic clock). It
+// broadcasts a `ClockState` on every control and once a second while
+// playing. A follower advances `position + max(0, now - at - countIn)` on
+// its own clock, corrected to server time by a ping round trip. Nobody
+// trusts their own wall clock.
+//
+// Time is the host's. Every method takes `nowMs` and nothing here reads a
+// clock. Milliseconds are Float64: a wall-clock reading is around 1.7e12
+// and does not fit Int32, and Float64 is exact for every value in play and
+// is the host's own number on JS, Lua, Python and Elixir. Hosts that want
+// integers round at their edge.
+
+export class ClockStatus {
+  public static let playing = "playing";
+  public static let paused = "paused";
+}
+
+// What the server broadcasts: everything a follower needs to know where
+// "now" is, read at one instant. `countInMs` is what is LEFT of the
+// count-in, so a late joiner and a heartbeat read the same.
+export class ClockState(
+  public status: String,
+  public positionMs: Float64,
+  public countInMs: Float64,
+  // the server's wall clock, ms, when this was read
+  public at: Float64,
+) {}
+
+// ---------- the server ----------
+
+// The clock for one score, as the server holds it. `atMs` is on whatever
+// clock the host passes as `nowMs` (Jam Pilot: monotonic); the wall clock
+// only appears in `stateAt`, for the followers.
+export class RoomClock() {
+  public var status: String = ClockStatus.paused;
+  public var positionMs: Float64 = 0.0;
+  public var countInMs: Float64 = 0.0;
+  public var atMs: Float64 = 0.0;
+
+  public get playing(): Boolean { status == ClockStatus.playing }
+
+  // Play from `fromMs` (null: from where the clock stands), after holding
+  // there for `countInMs` (0.0 starts at once). A resume during a count-in
+  // restarts the hold: the position has not moved yet.
+  public play(nowMs: Float64, fromMs: Float64?, countInMs: Float64): Void {
+    let from = fromMs ?? positionAt(nowMs);
+    positionMs = from;
+    this.countInMs = countInMs.max(0.0);
+    atMs = nowMs;
+    status = ClockStatus.playing;
+  }
+
+  // Pause where the song stands. During a count-in that is the start of
+  // the bar, and the count is dropped: a later play asks for a new one.
+  public pause(nowMs: Float64): Void {
+    positionMs = positionAt(nowMs);
+    countInMs = 0.0;
+    atMs = nowMs;
+    status = ClockStatus.paused;
+  }
+
+  // Jump to `toMs`, keeping the status; a count-in in progress is dropped.
+  public seek(nowMs: Float64, toMs: Float64): Void {
+    positionMs = toMs;
+    countInMs = 0.0;
+    atMs = nowMs;
+  }
+
+  // While the count-in runs the position holds; it advances from its end.
+  public positionAt(nowMs: Float64): Float64 {
+    if (playing) { positionMs + (nowMs - atMs - countInMs).max(0.0) } else { positionMs }
+  }
+
+  // What is left of the count-in; 0 once the song is going, or paused.
+  public countInLeftAt(nowMs: Float64): Float64 {
+    if (playing) { (countInMs - (nowMs - atMs)).max(0.0) } else { 0.0 }
+  }
+
+  // The broadcast: position, count-in and `at` read at the same instant.
+  public stateAt(nowMs: Float64, wallMs: Float64): ClockState {
+    new ClockState(status, positionAt(nowMs), countInLeftAt(nowMs), wallMs)
+  }
+}
+
+// ---------- the followers ----------
+
+// One ping's measurement: how long the round trip took and what it said
+// the server's clock was ahead of ours by.
+export class OffsetSample(public rttMs: Float64, public offsetMs: Float64) {}
+
+// how many of the fastest pings are kept
+export let offsetSamplesKept = 5;
+
+// The page's estimate of the server's wall clock. Each ping is sent at a
+// local time, answered with the server's time and received at a local
+// time; server now was about the answer plus half the trip. The fastest
+// round trips are the most honest about that half, so the estimate is the
+// offset of the fastest of the last few.
+export class ServerOffset() {
+  private var samples: List<OffsetSample> = [];
+
+  // the current estimate, null until the first ping answers
+  public get offsetMs(): Float64? {
+    if (samples.isEmpty) { null } else { samples[0].offsetMs }
+  }
+
+  public get known(): Boolean { !samples.isEmpty }
+
+  public get kept(): List<OffsetSample> { samples }
+
+  public sample(sentMs: Float64, serverNowMs: Float64, receivedMs: Float64): Void {
+    let rtt = receivedMs - sentMs;
+    let s = new OffsetSample(rtt, serverNowMs + rtt * 0.5 - receivedMs);
+    // kept sorted by round trip, fastest first, at most `offsetSamplesKept`
+    let b = new ListBuilder<OffsetSample>();
+    var placed = false;
+    for (let old of samples) {
+      if (!placed && rtt < old.rttMs) { b.add(s); placed = true; }
+      b.add(old);
+    }
+    if (!placed) { b.add(s); }
+    samples = b.toList().slice(0, b.length.min(offsetSamplesKept));
+  }
+
+  // the server's wall clock now, given ours; ours until a ping has answered
+  public serverNow(localNowMs: Float64): Float64 { localNowMs + (offsetMs ?? 0.0) }
+}
+
+// What a broadcast changed, so a listener can tell a heartbeat from a
+// transport event: a status change restarts the synth, a jump re-seeks
+// the cursor, a heartbeat that agrees with the prediction does nothing.
+export class StateChange(public statusChanged: Boolean, public jumped: Boolean) {}
+
+// a heartbeat that lands further than this from where the follower
+// predicted is a jump (a seek, or a follower that drifted)
+export let jumpThresholdMs = 150.0;
+
+// A page's copy of the room clock, kept from the server's broadcasts and
+// read on every animation frame. All `localNowMs` arguments are the
+// page's own wall clock; `offset` turns them into the server's.
+export class FollowerClock(public offset: ServerOffset = new ServerOffset()) {
+  public var status: String = ClockStatus.paused;
+  public var positionMs: Float64 = 0.0;
+  public var countInMs: Float64 = 0.0;
+  public var at: Float64 = 0.0;
+
+  public get playing(): Boolean { status == ClockStatus.playing }
+
+  public positionAt(localNowMs: Float64): Float64 {
+    if (playing) {
+      positionMs + (offset.serverNow(localNowMs) - at - countInMs).max(0.0)
+    } else {
+      positionMs
+    }
+  }
+
+  public countInLeftAt(localNowMs: Float64): Float64 {
+    if (playing) { (countInMs - (offset.serverNow(localNowMs) - at)).max(0.0) } else { 0.0 }
+  }
+
+  // Take a broadcast. Compares what the follower would have said against
+  // what the server says, so the caller knows whether anything moved.
+  public apply(state: ClockState, localNowMs: Float64): StateChange {
+    let predicted = positionAt(localNowMs);
+    let statusChanged = state.status != status;
+    status = state.status;
+    positionMs = state.positionMs;
+    countInMs = state.countInMs;
+    at = state.at;
+    let jumped = (positionAt(localNowMs) - predicted).abs() > jumpThresholdMs;
+    new StateChange(statusChanged, jumped)
+  }
+}

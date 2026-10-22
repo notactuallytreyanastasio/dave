@@ -1,0 +1,291 @@
+// Tests for the room clock and the count-in, ported from notedance_viewer's
+// test/dave/sessions_test.exs (which sleeps for real; here time is a
+// number the test moves) and from what count_in.js was checked against in
+// a headless browser. Every check runs in a function that takes the Test
+// with inputs read from a list, so the frontend cannot fold the calls and
+// the backend's own arithmetic is what runs.
+
+let { Test } = import("std/testing");
+
+// ---------- the timelines the checks use ----------
+
+// Mary Had a Little Lamb at 90 in 4/4: every bar 2667 ms, no pickup.
+let mary(): RoomTimeline {
+  let bars = new ListBuilder<Bar>();
+  let steps = new ListBuilder<PlaybackStep>();
+  for (var i = 0; i < 8; i += 1) {
+    bars.add(new Bar(i, i.toFloat64() * 2667.0, 2667.0, 2667.0));
+    steps.add(new PlaybackStep(i, i.toFloat64() * 2667.0));
+  }
+  new RoomTimeline(4, bars.toList(), steps.toList())
+}
+
+// A Ram Sam Sam at 120 in 4/4: a one-beat pickup, then full bars, with
+// bars 1 and 2 played twice (a repeat).
+let ramSamSam(): RoomTimeline {
+  let bars = [
+    new Bar(0, 0.0, 500.0, 2000.0),
+    new Bar(1, 500.0, 2000.0, 2000.0),
+    new Bar(2, 2500.0, 2000.0, 2000.0),
+    new Bar(3, 8500.0, 2000.0, 2000.0),
+  ];
+  let steps = [
+    new PlaybackStep(0, 0.0),
+    new PlaybackStep(1, 500.0),
+    new PlaybackStep(2, 2500.0),
+    new PlaybackStep(1, 4500.0),
+    new PlaybackStep(2, 6500.0),
+    new PlaybackStep(3, 8500.0),
+  ];
+  new RoomTimeline(4, bars, steps)
+}
+
+let wordsOf(c: List<String>): String { c.join(" ") { it => it } }
+
+// ---------- the server clock ----------
+
+test("a fresh clock is paused at zero") { test => freshClock(test); }
+let freshClock(test: Test): Void {
+  let c = new RoomClock();
+  let s = c.stateAt(1000.0, 5000.0);
+  assert(s.status == ClockStatus.paused);
+  assert(s.positionMs == 0.0);
+  assert(s.countInMs == 0.0);
+  assert(s.at == 5000.0);
+}
+
+test("play from a position advances with time") { test => playAdvances(test, [1000.0, 60.0]); }
+let playAdvances(test: Test, t: List<Float64>): Void {
+  let c = new RoomClock();
+  c.play(t[0], 0.0, 0.0);
+  assert(c.positionAt(t[0]) == 0.0);
+  assert(c.positionAt(t[0] + t[1]) == t[1]) { "got ${c.positionAt(t[0] + t[1])}" };
+  assert(c.stateAt(t[0] + t[1], 9.0).status == ClockStatus.playing);
+}
+
+test("pause freezes the position, play resumes from it") { test => pauseResumes(test, [1000.0, 50.0, 60.0]); }
+let pauseResumes(test: Test, t: List<Float64>): Void {
+  let c = new RoomClock();
+  c.play(t[0], 0.0, 0.0);
+  c.pause(t[0] + t[1]);
+  assert(c.status == ClockStatus.paused);
+  assert(c.positionAt(t[0] + t[1] + t[2]) == t[1]) { "held at ${c.positionAt(t[0] + t[1] + t[2])}" };
+  // resume: null position means from where it stands
+  c.play(t[0] + 200.0, null, 0.0);
+  assert(c.positionAt(t[0] + 210.0) == t[1] + 10.0) { "resumed at ${c.positionAt(t[0] + 210.0)}" };
+}
+
+test("a count-in holds the position for its length, then the clock runs from there") { test => countInHolds(test, [1000.0, 5000.0, 120.0]); }
+let countInHolds(test: Test, t: List<Float64>): Void {
+  let c = new RoomClock();
+  c.play(t[0], t[1], t[2]);
+  let held = c.stateAt(t[0], 0.0);
+  assert(held.status == ClockStatus.playing);
+  assert(held.positionMs == t[1]);
+  assert(held.countInMs == t[2]);
+
+  let later = c.stateAt(t[0] + 60.0, 0.0);
+  assert(later.positionMs == t[1]) { "moved during the count: ${later.positionMs}" };
+  assert(later.countInMs == 60.0) { "left ${later.countInMs}" };
+
+  let going = c.stateAt(t[0] + 180.0, 0.0);
+  assert(going.countInMs == 0.0);
+  assert(going.positionMs == t[1] + 60.0) { "after the count: ${going.positionMs}" };
+}
+
+test("a pause during the count-in keeps the start; a seek drops the count") { test => pauseInCount(test, [1000.0, 5000.0, 1000.0]); }
+let pauseInCount(test: Test, t: List<Float64>): Void {
+  let c = new RoomClock();
+  c.play(t[0], t[1], t[2]);
+  c.pause(t[0] + 300.0);
+  let paused = c.stateAt(t[0] + 300.0, 0.0);
+  assert(paused.status == ClockStatus.paused);
+  assert(paused.positionMs == t[1]);
+  assert(paused.countInMs == 0.0);
+
+  c.play(t[0] + 400.0, 0.0, t[2]);
+  c.seek(t[0] + 500.0, 2000.0);
+  let sought = c.stateAt(t[0] + 500.0, 0.0);
+  assert(sought.countInMs == 0.0);
+  assert(sought.status == ClockStatus.playing);
+  assert(c.positionAt(t[0] + 530.0) == 2030.0) { "after the seek: ${c.positionAt(t[0] + 530.0)}" };
+}
+
+test("a resume during a count-in restarts the hold where it stood") { test => resumeInCount(test, [1000.0, 5000.0, 1000.0]); }
+let resumeInCount(test: Test, t: List<Float64>): Void {
+  let c = new RoomClock();
+  c.play(t[0], t[1], t[2]);
+  // the TV presses play again 300 ms in, asking for a fresh count
+  c.play(t[0] + 300.0, null, t[2]);
+  assert(c.positionAt(t[0] + 300.0) == t[1]);
+  assert(c.countInLeftAt(t[0] + 300.0) == t[2]) { "left ${c.countInLeftAt(t[0] + 300.0)}" };
+}
+
+test("a negative count-in is no count-in") { test => negativeCount(test, [-5.0]); }
+let negativeCount(test: Test, t: List<Float64>): Void {
+  let c = new RoomClock();
+  c.play(0.0, 0.0, t[0]);
+  assert(c.countInLeftAt(0.0) == 0.0);
+  assert(c.positionAt(10.0) == 10.0);
+}
+
+// ---------- the followers ----------
+
+test("the offset is the fastest ping's, and only the fastest few are kept") { test => offsetKeepsFastest(test); }
+let offsetKeepsFastest(test: Test): Void {
+  let o = new ServerOffset();
+  assert(!o.known);
+  assert(o.serverNow(100.0) == 100.0);
+  // sent, server said, received: rtt 40 and the server 1000 ahead
+  o.sample(1000.0, 2020.0, 1040.0);
+  assert(o.offsetMs == 1000.0) { "offset ${o.offsetMs}" };
+  // a faster trip with a slightly different reading wins
+  o.sample(2000.0, 3007.0, 2010.0);
+  assert(o.offsetMs == 1002.0) { "offset ${o.offsetMs}" };
+  // slow pings pile up behind it and fall off the end
+  for (var i = 0; i < 10; i += 1) {
+    let sent = 3000.0 + i.toFloat64() * 100.0;
+    o.sample(sent, sent + 1100.0, sent + 200.0);
+  }
+  assert(o.kept.length == offsetSamplesKept) { "kept ${o.kept.length}" };
+  assert(o.offsetMs == 1002.0) { "offset ${o.offsetMs}" };
+  assert(o.serverNow(5000.0) == 6002.0);
+}
+
+test("a follower reads the broadcast through its offset") { test => followerReads(test, [1000.0]); }
+let followerReads(test: Test, t: List<Float64>): Void {
+  let o = new ServerOffset();
+  o.sample(0.0, t[0] + 10.0, 20.0); // server is 1000 ahead
+  let f = new FollowerClock(o);
+  let change = f.apply(new ClockState(ClockStatus.playing, 500.0, 0.0, t[0] + 100.0), 100.0);
+  assert(change.statusChanged);
+  assert(f.positionAt(100.0) == 500.0) { "at the broadcast: ${f.positionAt(100.0)}" };
+  assert(f.positionAt(350.0) == 750.0) { "250 later: ${f.positionAt(350.0)}" };
+}
+
+test("a heartbeat that agrees is not a jump; a seek is") { test => jumps(test); }
+let jumps(test: Test): Void {
+  let f = new FollowerClock();
+  f.apply(new ClockState(ClockStatus.playing, 0.0, 0.0, 1000.0), 1000.0);
+  let beat = f.apply(new ClockState(ClockStatus.playing, 1000.0, 0.0, 2000.0), 2000.0);
+  assert(!beat.statusChanged);
+  assert(!beat.jumped);
+  let seek = f.apply(new ClockState(ClockStatus.playing, 9000.0, 0.0, 2500.0), 2500.0);
+  assert(seek.jumped);
+  assert(!seek.statusChanged);
+  let pause = f.apply(new ClockState(ClockStatus.paused, 9100.0, 0.0, 2600.0), 2600.0);
+  assert(pause.statusChanged);
+  assert(!pause.jumped);
+}
+
+// The bug this module exists for. The server holds the position for a
+// 2000 ms count and heartbeats once a second; a follower that reads the
+// same formula never predicts a position the next heartbeat takes back.
+test("through a held count-in, heartbeats never move a follower backwards") { test => noWobble(test); }
+let noWobble(test: Test): Void {
+  let server = new RoomClock();
+  let f = new FollowerClock();
+  server.play(0.0, 4000.0, 2000.0);
+  var last = -1.0;
+  var backwards = 0;
+  var jumps = 0;
+  // 4 s at 50 ms, a heartbeat on every whole second
+  for (var i = 0; i <= 80; i += 1) {
+    let now = i.toFloat64() * 50.0;
+    if (i % 20 == 0) {
+      let change = f.apply(server.stateAt(now, now), now);
+      // the first broadcast is a jump for any follower (it joined at zero)
+      if (change.jumped && i > 0) { jumps += 1; }
+    }
+    let pos = f.positionAt(now);
+    if (pos < last) { backwards += 1; }
+    last = pos;
+  }
+  assert(backwards == 0) { "${backwards} backward moves" };
+  assert(jumps == 0) { "${jumps} heartbeats read as jumps" };
+  assert(last == 6000.0) { "ended at ${last}" };
+}
+
+// ---------- the count-in ----------
+
+test("a full bar counts the whole bar; a pickup counts what it lacks") { test => countLengths(test); }
+let countLengths(test: Test): Void {
+  let m = countInFor(mary(), 0.0);
+  assert(m.ms == 2667.0) { "mary ${m.ms}" };
+  assert(wordsOf(m.words) == "1 2 ready play") { "mary words ${wordsOf(m.words)}" };
+  assert(m.startMs == 0.0);
+
+  let r = countInFor(ramSamSam(), 0.0);
+  assert(r.ms == 1500.0) { "pickup count ${r.ms}" };
+  assert(r.beatMs == 500.0);
+  assert(wordsOf(r.words) == "1 ready play") { "pickup words ${wordsOf(r.words)}" };
+
+  // bar 1 is a full bar: four words, and a play from 1200 goes back to its top
+  let b1 = countInFor(ramSamSam(), 1200.0);
+  assert(b1.startMs == 500.0) { "bar start ${b1.startMs}" };
+  assert(wordsOf(b1.words) == "1 2 ready play");
+}
+
+test("a position in the second pass of a repeat starts that pass's bar") { test => secondPass(test); }
+let secondPass(test: Test): Void {
+  let step = stepAt(ramSamSam(), 5000.0);
+  assert(step.bar == 1) { "bar ${step.bar}" };
+  assert(step.startMs == 4500.0) { "start ${step.startMs}" };
+  assert(countInFor(ramSamSam(), 5000.0).startMs == 4500.0);
+  // before the first start: the first step
+  assert(stepAt(ramSamSam(), -10.0).bar == 0);
+}
+
+test("the words for a count") { test => wordLists(test, [0, 1, 2, 3, 4, 6]); }
+let wordLists(test: Test, ns: List<Int>): Void {
+  let want = ["", "play", "ready play", "1 ready play", "1 2 ready play", "1 2 3 4 ready play"];
+  for (var i = 0; i < ns.length; i += 1) {
+    assert(wordsOf(countInWords(ns[i])) == want[i]) { "n=${ns[i]}: ${wordsOf(countInWords(ns[i]))}" };
+  }
+}
+
+test("the word on the screen follows what is left of the count") { test => wordNow(test); }
+let wordNow(test: Test): Void {
+  let t = mary();
+  // 2667 ms of count, 666.75 per beat
+  let first = countInNow(t, 0.0, 2667.0);
+  assert(first != null && first.word == "1" && first.index == 0 && first.count == 4) { "at the start: ${first?.word}" };
+  let second = countInNow(t, 0.0, 1900.0);
+  assert(second != null && second.word == "2") { "at 1900 left: ${second?.word}" };
+  let ready = countInNow(t, 0.0, 1300.0);
+  assert(ready != null && ready.word == "ready") { "at 1300 left: ${ready?.word}" };
+  let play = countInNow(t, 0.0, 600.0);
+  assert(play != null && play.word == "play" && play.index == 3) { "at 600 left: ${play?.word}" };
+  // the last sliver still says play, never a fifth beat
+  let sliver = countInNow(t, 0.0, 1.0);
+  assert(sliver != null && sliver.word == "play") { "at 1 left: ${sliver?.word}" };
+  // more left than the count has (a clock skew): the first word, not a crash
+  let skew = countInNow(t, 0.0, 9000.0);
+  assert(skew != null && skew.word == "1") { "at 9000 left: ${skew?.word}" };
+  assert(countInNow(t, 0.0, 0.0) == null);
+  assert(countInNow(t, 0.0, -5.0) == null);
+}
+
+test("the TV and an iPad show the same word from the same clock") { test => sameWord(test); }
+let sameWord(test: Test): Void {
+  let t = ramSamSam();
+  let server = new RoomClock();
+  let tv = new FollowerClock();
+  let o = new ServerOffset();
+  o.sample(0.0, 250.0, 100.0); // the iPad is 200 behind the server
+  let ipad = new FollowerClock(o);
+  server.play(10000.0, 0.0, 1500.0);
+  let state = server.stateAt(10000.0, 10000.0);
+  tv.apply(state, 10000.0);
+  ipad.apply(state, 9800.0);
+  let seen = new ListBuilder<String>();
+  for (var i = 0; i < 4; i += 1) {
+    let serverNow = 10000.0 + i.toFloat64() * 500.0 + 10.0;
+    let onTv = countInNow(t, tv.positionAt(serverNow), tv.countInLeftAt(serverNow));
+    let onIpad = countInNow(t, ipad.positionAt(serverNow - 200.0), ipad.countInLeftAt(serverNow - 200.0));
+    let a = if (onTv == null) { "-" } else { onTv.word };
+    let b = if (onIpad == null) { "-" } else { onIpad.word };
+    seen.add("${a}/${b}");
+  }
+  assert(seen.join(" ") { it => it } == "1/1 ready/ready play/play -/-") { seen.join(" ") { it => it } };
+}

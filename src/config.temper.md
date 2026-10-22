@@ -20,3 +20,5 @@ other module is listed.
     import("./rounds");
     import("./repair");
     import("./compose");
+    import("./room");
+    import("./agent");

@@ -1,0 +1,294 @@
+// Tests for the generic agent: a specialty in code, the host's buckets,
+// and the tool turns inside a round. Driven the way repair_test.temper
+// drives its loop: a scripted model, a scripted host, every request kept.
+//
+// No std import here: the module's library files already bind what the
+// tests use (see probes/js-test-std-import).
+
+// A librarian: looks things up on the shelf, never in the kitchen.
+class Librarian extends Specialty {
+  public get name(): String { "librarian" }
+  public get systemPrompt(): String { "You find books. Use lookup; answer with the shelf mark." }
+  public get buckets(): List<String> { ["shelf"] }
+  public opening(task: String): String { "Find: ${task}" }
+}
+
+// The smallest specialty: a name and a prompt, no tools.
+class Greeter extends Specialty {
+  public get name(): String { "greeter" }
+  public get systemPrompt(): String { "Greet people." }
+}
+
+let schema(): JsonSyntaxTree { parseJson("{\"type\":\"object\"}") orelse panic() }
+
+let catalogue(): List<ToolBucket> {
+  [
+    new ToolBucket("shelf", [new FunctionTool("lookup", "Find a book by title", schema())]),
+    new ToolBucket("kitchen", [new FunctionTool("boil", "Boil water", schema())]),
+  ]
+}
+
+// A scripted reply: text, tool calls, a cut-off, or a transport failure.
+sealed interface AgentScripted {}
+class AgentSays(public text: String) extends AgentScripted {}
+class AgentCalls(public calls: List<ToolCall>) extends AgentScripted {}
+class AgentCutOff(public reasoningTokens: Int) extends AgentScripted {}
+class AgentDead(public why: String) extends AgentScripted {}
+
+// Drive the agent to its end. Every request the model would have seen is
+// kept in `requests`; every RunTools the host was asked for in `runs`.
+class AgentRun(public agent: GenericAgent, public script: List<AgentScripted>, public refuseFirst: Boolean) {
+  public requests: ListBuilder<ChatRequest> = new ListBuilder<ChatRequest>();
+  public runs: ListBuilder<List<ToolRun>> = new ListBuilder<List<ToolRun>>();
+  public var checks: Int = 0;
+  public var answer: String? = null;
+  public var attempts: List<Attempt> = [];
+  public var gaveUp: Boolean = false;
+  public var cause: String = "";
+
+  public completion(message: AssistantMessage, finish: String, reasoning: Int?): ChatResponse {
+    new ChatResponse("r", "m", [new Choice(0, message, finish)], null, new Usage(10, 20, 30, reasoning))
+  }
+
+  // The host's tools: lookup answers with a shelf mark, anything else is
+  // the host's own failure sentence (the model should hear it).
+  public tool(run: ToolRun): ToolResult {
+    let text = if (run.bucket == "shelf" && run.call.name == "lookup") {
+      "QA76.73 for ${run.call.arguments}"
+    } else {
+      "tool ${run.call.name} failed: no such bucket ${run.bucket}"
+    };
+    new ToolResult(run.call.id, text)
+  }
+
+  public go(): Void {
+    var step = agent.next(new Start());
+    var replies = 0;
+    var running = true;
+    while (running) {
+      let current = step;
+      when (current) {
+        is SendRequest -> do {
+          requests.add(current.request);
+          if (replies >= script.length) {
+            step = agent.next(new TransportFailed("scripted model ran out of replies"));
+          } else {
+            let next = script[replies];
+            replies += 1;
+            step = when (next) {
+              is AgentSays -> agent.next(new Responded(completion(new AssistantMessage(next.text), FinishReasons.stop, 100)));
+              is AgentCalls -> agent.next(new Responded(completion(new AssistantMessage(null, next.calls), FinishReasons.toolCalls, 100)));
+              is AgentCutOff -> agent.next(new Responded(completion(new AssistantMessage(null), FinishReasons.length, next.reasoningTokens)));
+              is AgentDead -> agent.next(new TransportFailed(next.why));
+            };
+          }
+        };
+        is RunTools -> do {
+          runs.add(current.runs);
+          let results = new ListBuilder<ToolResult>();
+          // results go back in reverse: the engine matches by id, not order
+          for (var i = current.runs.length - 1; i >= 0; i -= 1) { results.add(tool(current.runs[i])); }
+          step = agent.next(new ToolsRan(results.toList()));
+        };
+        is Check -> do {
+          checks += 1;
+          step = if (refuseFirst && checks == 1) {
+            agent.next(new CheckRefused(["The shelf mark must start with a letter."]))
+          } else {
+            agent.next(new CheckPassed())
+          };
+        };
+        is Done -> do {
+          answer = current.candidate.text;
+          attempts = current.attempts;
+          running = false;
+        };
+        is GaveUp -> do {
+          attempts = current.attempts;
+          gaveUp = true;
+          cause = current.cause;
+          running = false;
+        };
+      }
+    }
+  }
+}
+
+let agentRoles(request: ChatRequest): String {
+  request.messages.map { (m): String => m.role }.join(" ") { it => it }
+}
+
+let toolNames(request: ChatRequest): String {
+  request.tools.map { (t): String => t.name }.join(" ") { it => it }
+}
+
+let agentLastUser(request: ChatRequest): String {
+  let ms = request.messages;
+  var text = "";
+  for (var i = 0; i < ms.length; i += 1) {
+    let m = ms[i];
+    when (m) {
+      is UserMessage -> do { text = m.text ?? ""; };
+      else -> do {};
+    }
+  }
+  text
+}
+
+let toolText(request: ChatRequest, callId: String): String {
+  let ms = request.messages;
+  var text = "";
+  for (var i = 0; i < ms.length; i += 1) {
+    let m = ms[i];
+    when (m) {
+      is ToolMessage -> do { if (m.toolCallId == callId) { text = m.content; } };
+      else -> do {};
+    }
+  }
+  text
+}
+
+let lookupCall(id: String, title: String): ToolCall {
+  new ToolCall(id, "lookup", "{\"title\": \"${title}\"}")
+}
+
+let librarian(script: List<AgentScripted>, toolTurns: Int, refuseFirst: Boolean): AgentRun {
+  new AgentRun(new GenericAgent("m", "the dragon book", new Librarian(), catalogue(), toolTurns), script, refuseFirst)
+}
+
+test("a tool turn: the call runs in its bucket, the result goes back, the answer is checked") { test =>
+  let run = librarian([
+    new AgentCalls([lookupCall("c1", "Compilers")]),
+    new AgentSays("QA76.73"),
+  ], 8, false);
+  run.go();
+  assert(run.answer == "QA76.73") { "answer ${run.answer}" }
+  assert(run.runs.length == 1) { "runs ${run.runs.length}" }
+  assert(run.runs[0][0].bucket == "shelf") { "bucket ${run.runs[0][0].bucket}" }
+  assert(run.requests.length == 2) { "requests ${run.requests.length}" }
+  // only the librarian's bucket is offered, on every request
+  assert(toolNames(run.requests[0]) == "lookup") { "tools ${toolNames(run.requests[0])}" }
+  assert(run.requests[0].toolChoice == null) { "tool_choice set on the first request" }
+  assert(agentRoles(run.requests[1]) == "system user assistant tool") { "agentRoles ${agentRoles(run.requests[1])}" }
+  assert(toolText(run.requests[1], "c1") == "QA76.73 for {\"title\": \"Compilers\"}") { "tool text ${toolText(run.requests[1], "c1")}" }
+  assert(agentLastUser(run.requests[0]) == "Find: the dragon book") { "opening ${agentLastUser(run.requests[0])}" }
+  assert(run.checks == 1) { "checks ${run.checks}" }
+  assert(run.attempts.length == 1 && run.attempts[0].toolCalls == 1) { "attempts ${run.attempts.length}" }
+}
+
+test("a call to a tool in no offered bucket is answered by the engine, not the host") { test =>
+  let run = librarian([
+    new AgentCalls([new ToolCall("c1", "boil", "{}"), lookupCall("c2", "Compilers")]),
+    new AgentSays("QA76.73"),
+  ], 8, false);
+  run.go();
+  assert(run.answer == "QA76.73") { "answer ${run.answer}" }
+  // the host saw one run, the lookup; the boil was answered in the engine
+  assert(run.runs.length == 1 && run.runs[0].length == 1) { "runs ${run.runs.length}" }
+  assert(run.runs[0][0].call.id == "c2") { "run id ${run.runs[0][0].call.id}" }
+  assert(toolText(run.requests[1], "c1") == "There is no tool named \"boil\". The tools are: lookup.") { "boil text ${toolText(run.requests[1], "c1")}" }
+  assert(agentRoles(run.requests[1]) == "system user assistant tool tool") { "agentRoles ${agentRoles(run.requests[1])}" }
+  assert(run.attempts[0].toolCalls == 2) { "toolCalls ${run.attempts[0].toolCalls}" }
+}
+
+test("a turn of only unknown tools goes straight back to the model") { test =>
+  let run = librarian([
+    new AgentCalls([new ToolCall("c1", "boil", "{}")]),
+    new AgentSays("QA76.73"),
+  ], 8, false);
+  run.go();
+  assert(run.answer == "QA76.73") { "answer ${run.answer}" }
+  assert(run.runs.isEmpty) { "host was asked to run ${run.runs.length}" }
+  assert(run.requests.length == 2) { "requests ${run.requests.length}" }
+}
+
+test("after the round's tool turns the tools are closed and the answer asked for") { test =>
+  let run = librarian([
+    new AgentCalls([lookupCall("c1", "Compilers")]),
+    new AgentCalls([lookupCall("c2", "Dragons")]),
+    new AgentSays("QA76.73"),
+  ], 2, false);
+  run.go();
+  assert(run.answer == "QA76.73") { "answer ${run.answer}" }
+  assert(run.requests.length == 3) { "requests ${run.requests.length}" }
+  assert(run.requests[1].toolChoice == null) { "tools closed after one turn of two" }
+  assert(run.requests[2].toolChoice is NoToolChoice) { "tool_choice not none on the third request" }
+  assert(agentLastUser(run.requests[2]) == "That was the last tool call allowed this round. Answer now, without calling a tool.") { "turn ${agentLastUser(run.requests[2])}" }
+  assert(run.attempts[0].toolCalls == 2) { "toolCalls ${run.attempts[0].toolCalls}" }
+}
+
+test("tools called after they were closed fail the round; the next round has them open again") { test =>
+  let run = librarian([
+    new AgentCalls([lookupCall("c1", "Compilers")]),
+    new AgentCalls([lookupCall("c2", "Dragons")]),
+    new AgentSays("QA76.73"),
+  ], 1, false);
+  run.go();
+  assert(run.answer == "QA76.73") { "answer ${run.answer}" }
+  assert(run.attempts.length == 2) { "attempts ${run.attempts.length}" }
+  assert(run.attempts[0].error == "the model called tools after they were closed") { "error ${run.attempts[0].error}" }
+  assert(run.attempts[0].toolCalls == 2) { "toolCalls ${run.attempts[0].toolCalls}" }
+  // round 2: the budget starts over, so no tool_choice
+  assert(run.requests[2].toolChoice == null) { "tool_choice still set in round 2" }
+  assert(run.runs.length == 1) { "runs ${run.runs.length}" }
+}
+
+test("a refused answer goes back with the check's sentences; the next round may use tools again") { test =>
+  let run = librarian([
+    new AgentSays("76.73"),
+    new AgentCalls([lookupCall("c1", "Compilers")]),
+    new AgentSays("QA76.73"),
+  ], 8, true);
+  run.go();
+  assert(run.answer == "QA76.73") { "answer ${run.answer}" }
+  assert(run.checks == 2) { "checks ${run.checks}" }
+  assert(agentLastUser(run.requests[1]) == "That answer was refused: The shelf mark must start with a letter. Answer again.") { "turn ${agentLastUser(run.requests[1])}" }
+  assert(run.attempts.length == 2) { "attempts ${run.attempts.length}" }
+  assert(run.attempts[0].toolCalls == 0 && run.attempts[1].toolCalls == 1) { "toolCalls ${run.attempts[0].toolCalls} ${run.attempts[1].toolCalls}" }
+}
+
+test("a cut-off after tool calls is asked for again, in a new round with the tools open") { test =>
+  let run = librarian([
+    new AgentCalls([lookupCall("c1", "Compilers")]),
+    new AgentCutOff(7900),
+    new AgentSays("QA76.73"),
+  ], 1, false);
+  run.go();
+  assert(run.answer == "QA76.73") { "answer ${run.answer}" }
+  assert(run.attempts.length == 2) { "attempts ${run.attempts.length}" }
+  assert(run.attempts[0].error == "the model ran out of room: 7900 of 8000 tokens went to thinking and the reply was cut off before any answer") { "error ${run.attempts[0].error}" }
+  assert(run.attempts[0].toolCalls == 1) { "toolCalls ${run.attempts[0].toolCalls}" }
+  assert(run.requests[2].toolChoice == null) { "tool_choice set in round 2" }
+}
+
+test("the smallest specialty: no buckets, no tools, the reply is the answer") { test =>
+  let agent = new GenericAgent("m", "hello", new Greeter(), catalogue(), 8);
+  let run = new AgentRun(agent, [new AgentSays("Hello to you.")], false);
+  run.go();
+  assert(run.answer == "Hello to you.") { "answer ${run.answer}" }
+  assert(run.requests[0].tools.isEmpty) { "tools offered: ${toolNames(run.requests[0])}" }
+  assert(agentLastUser(run.requests[0]) == "hello") { "opening ${agentLastUser(run.requests[0])}" }
+  assert(agent.buckets.isEmpty && agent.missing.isEmpty) { "buckets ${agent.buckets.length} missing ${agent.missing.length}" }
+}
+
+test("a bucket the catalogue lacks is reported, by name") { test =>
+  let agent = new GenericAgent("m", "x", new Librarian(), [catalogue()[1]], 8);
+  assert(agent.missing.join(",") { it => it } == "shelf") { "missing ${agent.missing.join(",") { it => it }}" }
+  assert(agent.buckets.isEmpty) { "buckets ${agent.buckets.length}" }
+}
+
+test("an empty reply is unreadable and goes back; out of rounds gives up") { test =>
+  let run = librarian([new AgentSays(""), new AgentSays(""), new AgentSays("")], 8, false);
+  run.go();
+  assert(run.gaveUp) { "did not give up" }
+  assert(run.cause == GiveUpCauses.outOfRounds) { "cause ${run.cause}" }
+  assert(run.attempts.length == 3) { "attempts ${run.attempts.length}" }
+  assert(agentLastUser(run.requests[1]) == "That reply could not be used: The reply was empty. Answer again.") { "turn ${agentLastUser(run.requests[1])}" }
+}
+
+test("a transport failure ends the loop with its sentence") { test =>
+  let run = librarian([new AgentDead("no route to host")], 8, false);
+  run.go();
+  assert(run.gaveUp && run.cause == GiveUpCauses.transportFailed) { "cause ${run.cause}" }
+  assert(run.agent.lastProblems.join("|") { it => it } == "no route to host") { "problems ${run.agent.lastProblems.join("|") { it => it }}" }
+}
