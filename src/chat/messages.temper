@@ -1,0 +1,284 @@
+// Messages: the conversation as the chat-completions format spells it.
+//
+// A message is one of four roles, modelled as a sealed interface so hosts
+// get a sum type (Rust enum, C#/Java class hierarchy, `when` in Temper)
+// instead of a bag of nullable fields that only make sense in some roles.
+
+let {
+  JsonProducer, JsonSyntaxTree, JsonString, JsonArray, parseJson,
+} = import("std/json");
+
+export class Roles {
+  public static let system = "system";
+  public static let user = "user";
+  public static let assistant = "assistant";
+  public static let tool = "tool";
+}
+
+// ---------- Content parts ----------
+
+// User content is either a string or an array of typed parts. Decoded,
+// both become a List<ContentPart>; encoded, a lone text part goes back out
+// as a plain string, which is what every provider accepts.
+export sealed interface ContentPart {
+  public encodeToJson(p: JsonProducer): Void;
+}
+
+export class TextPart(public text: String) extends ContentPart {
+  public encodeToJson(p: JsonProducer): Void {
+    p.startObject();
+    p.objectKey("type"); p.stringValue("text");
+    p.objectKey("text"); p.stringValue(text);
+    p.endObject();
+  }
+}
+
+export class ImagePart(
+  public url: String,
+  // "auto", "low" or "high" in the OpenAI API; passed through untouched.
+  public detail: String? = null,
+) extends ContentPart {
+  public encodeToJson(p: JsonProducer): Void {
+    p.startObject();
+    p.objectKey("type"); p.stringValue("image_url");
+    p.objectKey("image_url");
+    p.startObject();
+    p.objectKey("url"); p.stringValue(url);
+    keyStringOrSkip(p, "detail", detail);
+    p.endObject();
+    p.endObject();
+  }
+}
+
+let encodeContent(p: JsonProducer, parts: List<ContentPart>): Void {
+  if (parts.length == 1 && parts[0] is TextPart) {
+    let only = parts[0];
+    when (only) {
+      is TextPart -> p.stringValue(only.text);
+      else -> panic();
+    }
+  } else {
+    p.startArray();
+    for (let part of parts) { part.encodeToJson(p); }
+    p.endArray();
+  }
+}
+
+// Built through a ListBuilder<ContentPart>: a `[new TextPart(..)]` literal
+// translates to a Vec<TextPart> in Rust, which is not a Vec<ContentPart>,
+// and rustc refuses it.
+let textOnly(text: String): List<ContentPart> {
+  let parts = new ListBuilder<ContentPart>();
+  parts.add(new TextPart(text));
+  parts.toList()
+}
+
+let decodeContentParts(t: JsonSyntaxTree?, path: String, problems: Problems): List<ContentPart> throws Bubble {
+  when (t) {
+    is JsonString -> textOnly(t.content);
+    is JsonArray -> do {
+      let out = new ListBuilder<ContentPart>();
+      var i = 0;
+      while (i < t.elements.length) {
+        out.add(decodeContentPart(t.elements[i], "${path}[${i}]", problems));
+        i += 1;
+      }
+      out.toList()
+    };
+    else -> do { problems.add(path, "expected string or array of content parts, got ${kindOf(t)}"); bubble() }
+  }
+}
+
+let decodeContentPart(t: JsonSyntaxTree, path: String, problems: Problems): ContentPart throws Bubble {
+  let o = Obj.at(t, path, problems);
+  let kind = o.string("type");
+  when (kind) {
+    "text" -> new TextPart(o.string("text"));
+    "image_url" -> do {
+      let img = o.obj("image_url");
+      new ImagePart(img.string("url"), img.stringOrNull("detail"))
+    };
+    else -> do { o.fail("type", "unknown content part type \"${kind}\""); bubble() }
+  }
+}
+
+// The text of a content list: the text parts joined, or null if there is
+// no text at all (an image-only message).
+export let contentText(parts: List<ContentPart>): String? {
+  let texts = new ListBuilder<String>();
+  for (let part of parts) {
+    when (part) {
+      is TextPart -> texts.add(part.text);
+      is ImagePart -> void;
+    }
+  }
+  if (texts.isEmpty) { null } else { texts.join("") { it => it } }
+}
+
+// ---------- Tool calls ----------
+
+// A request from the model to run a tool. `arguments` stays the JSON text
+// the model produced: the host parses it against its own schema, and a
+// model can produce invalid JSON, which the host must be able to see.
+export class ToolCall(
+  public id: String,
+  public name: String,
+  public arguments: String,
+) {
+  public encodeToJson(p: JsonProducer): Void {
+    p.startObject();
+    p.objectKey("id"); p.stringValue(id);
+    p.objectKey("type"); p.stringValue("function");
+    p.objectKey("function");
+    p.startObject();
+    p.objectKey("name"); p.stringValue(name);
+    p.objectKey("arguments"); p.stringValue(arguments);
+    p.endObject();
+    p.endObject();
+  }
+
+  // The arguments as a JSON tree, or a problem naming the call.
+  public argumentsTree(problems: Problems): JsonSyntaxTree throws Bubble {
+    parseJson(arguments) orelse do {
+      problems.add("tool_call ${id}", "arguments are not valid JSON");
+      bubble()
+    }
+  }
+
+  public static decode(t: JsonSyntaxTree, path: String, problems: Problems): ToolCall throws Bubble {
+    let o = Obj.at(t, path, problems);
+    let kind = o.string("type");
+    if (kind != "function") { o.fail("type", "unknown tool call type \"${kind}\""); }
+    let f = o.obj("function");
+    new ToolCall(o.string("id"), f.string("name"), f.string("arguments"))
+  }
+}
+
+let decodeToolCalls(elements: List<JsonSyntaxTree>, path: String, problems: Problems): List<ToolCall> throws Bubble {
+  let out = new ListBuilder<ToolCall>();
+  var i = 0;
+  while (i < elements.length) {
+    out.add(ToolCall.decode(elements[i], "${path}[${i}]", problems));
+    i += 1;
+  }
+  out.toList()
+}
+
+// ---------- Messages ----------
+
+export sealed interface Message {
+  public get role(): String;
+  public encodeToJson(p: JsonProducer): Void;
+}
+
+export class SystemMessage(
+  public content: String,
+  public name: String? = null,
+) extends Message {
+  public get role(): String { Roles.system }
+  public encodeToJson(p: JsonProducer): Void {
+    p.startObject();
+    p.objectKey("role"); p.stringValue(Roles.system);
+    p.objectKey("content"); p.stringValue(content);
+    keyStringOrSkip(p, "name", name);
+    p.endObject();
+  }
+}
+
+export class UserMessage(
+  public parts: List<ContentPart>,
+  public name: String? = null,
+) extends Message {
+  public static fromText(text: String, name: String? = null): UserMessage {
+    new UserMessage(textOnly(text), name)
+  }
+  public get role(): String { Roles.user }
+  public get text(): String? { contentText(parts) }
+  public encodeToJson(p: JsonProducer): Void {
+    p.startObject();
+    p.objectKey("role"); p.stringValue(Roles.user);
+    p.objectKey("content"); encodeContent(p, parts);
+    keyStringOrSkip(p, "name", name);
+    p.endObject();
+  }
+}
+
+export class AssistantMessage(
+  public content: String? = null,
+  public toolCalls: List<ToolCall> = [],
+  public refusal: String? = null,
+  public name: String? = null,
+) extends Message {
+  public get role(): String { Roles.assistant }
+  public get hasToolCalls(): Boolean { !toolCalls.isEmpty }
+  public encodeToJson(p: JsonProducer): Void {
+    p.startObject();
+    p.objectKey("role"); p.stringValue(Roles.assistant);
+    // Always written: an assistant turn with tool calls has null content,
+    // and providers reject a missing key more often than an explicit null.
+    p.objectKey("content");
+    let c = content;
+    if (c == null) { p.nullValue(); } else { p.stringValue(c); }
+    if (!toolCalls.isEmpty) {
+      p.objectKey("tool_calls");
+      p.startArray();
+      for (let call of toolCalls) { call.encodeToJson(p); }
+      p.endArray();
+    }
+    keyStringOrSkip(p, "refusal", refusal);
+    keyStringOrSkip(p, "name", name);
+    p.endObject();
+  }
+}
+
+export class ToolMessage(
+  public toolCallId: String,
+  public content: String,
+) extends Message {
+  public get role(): String { Roles.tool }
+  public encodeToJson(p: JsonProducer): Void {
+    p.startObject();
+    p.objectKey("role"); p.stringValue(Roles.tool);
+    p.objectKey("tool_call_id"); p.stringValue(toolCallId);
+    p.objectKey("content"); p.stringValue(content);
+    p.endObject();
+  }
+}
+
+let decodeMessage(t: JsonSyntaxTree?, path: String, problems: Problems): Message throws Bubble {
+  let o = Obj.at(t, path, problems);
+  let role = o.string("role");
+  when (role) {
+    "system" -> new SystemMessage(o.string("content"), o.stringOrNull("name"));
+    "user" -> new UserMessage(
+      decodeContentParts(o.raw("content"), o.child("content"), problems),
+      o.stringOrNull("name"),
+    );
+    "assistant" -> decodeAssistantMessage(o);
+    "tool" -> new ToolMessage(o.string("tool_call_id"), o.string("content"));
+    else -> do { o.fail("role", "unknown role \"${role}\""); bubble() }
+  }
+}
+
+// An assistant message as it arrives in a response: content may be a
+// string or null, and tool_calls is present only when there are any.
+let decodeAssistantMessage(o: Obj): AssistantMessage throws Bubble {
+  let role = o.string("role");
+  if (role != "assistant") { o.fail("role", "expected \"assistant\", got \"${role}\""); }
+  new AssistantMessage(
+    o.stringOrNull("content"),
+    decodeToolCalls(o.listOrEmpty("tool_calls"), o.child("tool_calls"), o.problems),
+    o.stringOrNull("refusal"),
+    o.stringOrNull("name"),
+  )
+}
+
+let decodeMessages(elements: List<JsonSyntaxTree>, path: String, problems: Problems): List<Message> throws Bubble {
+  let out = new ListBuilder<Message>();
+  var i = 0;
+  while (i < elements.length) {
+    out.add(decodeMessage(elements[i], "${path}[${i}]", problems));
+    i += 1;
+  }
+  out.toList()
+}

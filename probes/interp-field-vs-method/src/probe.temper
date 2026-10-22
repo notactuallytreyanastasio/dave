@@ -1,0 +1,30 @@
+// A class whose field and method share a name. Which does the bare name
+// inside the method mean?
+
+export class Clash {
+  private var finish: String? = null;
+  public set(v: String): Void { finish = v; }
+  public finish(): String { finish ?? "none" }
+}
+
+export class NoClash {
+  private var finishSeen: String? = null;
+  public set(v: String): Void { finishSeen = v; }
+  public finish(): String { finishSeen ?? "none" }
+}
+
+let runClash(test: Test): Void {
+  let c = new Clash();
+  c.set("stop");
+  let got = c.finish();
+  assert(got == "stop") { "clash: got `${got}`" }
+}
+test("field and method named finish") { test => runClash(test); }
+
+let runNoClash(test: Test): Void {
+  let c = new NoClash();
+  c.set("stop");
+  let got = c.finish();
+  assert(got == "stop") { "no clash: got `${got}`" }
+}
+test("field finishSeen, method finish") { test => runNoClash(test); }

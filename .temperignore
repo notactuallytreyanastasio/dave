@@ -1,0 +1,12 @@
+# Paths the Temper CLI must not scan for sources.
+temper.out/
+build/
+bin/
+scripts/
+probes/
+docs/
+.claude/
+.deciduous/
+.github/
+.git/
+temper.keep/

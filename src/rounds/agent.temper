@@ -1,0 +1,350 @@
+// The engine: ask, read, check, send the problems back, up to N rounds.
+//
+// `RoundsAgent` is a step machine. The host asks `next(event)` and performs
+// the step it gets: `SendRequest` goes to the model through the host's
+// transport, `Check` runs the host's reader on the candidate, `Done` and
+// `GaveUp` end the loop with every round recorded. Nothing here opens a
+// socket, reads a clock or calls back; the same loop runs as an Elixir
+// Task, a Python coroutine or a blocking Lua loop.
+//
+// What differs between loops is plugged in:
+//   - `RoundsPolicy`: rounds, temperature, max_tokens, the reasoning effort
+//     per kind of round, whether a cut-off is retried, whether a draft is kept.
+//   - `Script`: the turns the model hears and the sentences the record keeps.
+//   - `ReplyReader`: the reply as a proposal, and the proposal as the text to check.
+// The opening user turn is built by the loop's own setup and handed in as a
+// string; the system prompt is the host's.
+//
+// A loop may offer tools, in `ToolBucket`s. A reply that calls them is a
+// `RunTools` step inside the round: the host runs them and reports
+// `ToolsRan`, the results go into the conversation as tool messages, and
+// the model is asked again. A call naming no offered tool is answered here
+// with the names there are. After `toolTurns` such turns in one round the
+// tools are closed (`tool_choice: "none"`) and the script asks for the
+// answer; a model that calls tools anyway has failed the round. Repair and
+// compose offer none and never see any of this.
+
+let { JsonString, JsonSyntaxTree } = import("std/json");
+let {
+  Problems, ChatRequest, ChatResponse, Message, SystemMessage, UserMessage, AssistantMessage, ToolMessage,
+  FunctionTool, ToolChoice, NoToolChoice, FinishReasons,
+} = import("../chat");
+
+export class RoundsPolicy(
+  public rounds: Int,
+  public temperature: Float64,
+  public maxTokens: Int,
+  // sent as `reasoning_effort` on round 1; null leaves it out
+  public effort: String?,
+  // on a round after a reply that was refused (by the reader or the host)
+  public retryEffort: String?,
+  // on the round after a cut-off, when one is retried
+  public cutOffEffort: String?,
+  // a reply cut off at max_tokens: asked for again with script.cutOffTurn,
+  // or the end of the loop with the cut-off sentence
+  public retryCutOff: Boolean,
+  // the last candidate the host refused but said to keep is handed back in GaveUp
+  public keepDraft: Boolean,
+) {}
+
+// The words of one loop. Turns go to the model; records go into the Attempt
+// rows and, through GaveUp.problems, to the person.
+export interface Script {
+  // after a reply the reader could not read or realise; `problems` are its sentences
+  unreadableTurn(problems: List<String>): String;
+  // after a candidate the host's check refused, with its sentences
+  refusedTurn(problems: List<String>): String;
+  // after a reply cut off at max_tokens, when the policy retries one; `why` is the cut-off record
+  cutOffTurn(why: String): String;
+  // what the attempt records for a cut-off reply
+  cutOffRecord(reasoningTokens: Int?, maxTokens: Int, beforeAnyAnswer: Boolean): String;
+  // what the attempt records when the reader could not read the reply
+  unreadableRecord(problems: List<String>): String { problems.join(" ") { it => it } }
+  // what the attempt records when the host refused the candidate
+  refusedRecord(problems: List<String>): String { problems.join(" ") { it => it } }
+  // what the attempt records (and GaveUp.problems carries) for a transport failure
+  transportRecord(why: String, kind: String): String { why }
+  // after the round's last allowed tool turn: the tools are closed and the model is asked to answer
+  toolsExhaustedTurn(toolTurns: Int): String {
+    "That was the last tool call allowed this round. Answer now, without calling a tool."
+  }
+  // what the attempt records when the model called tools after they were closed
+  toolsAfterCloseRecord(): String { "the model called tools after they were closed" }
+}
+
+// The reader of one loop's replies.
+export interface ReplyReader {
+  // What the reply proposes. Bubbles, with the sentence for the model noted
+  // on `problems`, when the reply is not one.
+  read(reply: String, problems: Problems): Proposal throws Bubble;
+  // The text the host checks. A proposal that carries its text is that
+  // text; one made of edits is realised here, bubbling with the sentence on
+  // `problems` when it cannot be (an edit that does not place).
+  realize(proposal: Proposal, problems: Problems): String throws Bubble { proposal.text ?? panic() }
+}
+
+// The sentence both Jam Pilot loops record for a reply the model cut off
+// by thinking past max_tokens.
+export let ranOutOfRoom(reasoningTokens: Int?, maxTokens: Int, beforeAnyAnswer: Boolean): String {
+  let count = if (reasoningTokens == null) { "?" } else { reasoningTokens.toString() };
+  let tail = if (beforeAnyAnswer) { " before any answer" } else { "" };
+  "GLM ran out of room: ${count} of ${maxTokens} tokens went to thinking and the reply was cut off${tail}"
+}
+
+export class RoundsAgent(
+  public model: String,
+  public systemPrompt: String,
+  // the first user turn, built by the loop's setup
+  public opening: String,
+  public policy: RoundsPolicy,
+  public script: Script,
+  public reader: ReplyReader,
+  // the tools offered to the model, by bucket; none for a loop without tools
+  public buckets: List<ToolBucket> = [],
+  // tool turns allowed per round before the tools are closed
+  public toolTurns: Int = 8,
+) {
+  private messages: ListBuilder<Message> = new ListBuilder<Message>();
+  private attempts: ListBuilder<Attempt> = new ListBuilder<Attempt>();
+  private var round: Int = 1;
+  private var effort: String? = policy.effort;
+  private var pendingReply: String = "";
+  private var pendingCandidate: Candidate? = null;
+  private var kept: Draft? = null;
+  private var problems: List<String> = [];
+  private var toolTurnsUsed: Int = 0;
+  private var toolsClosed: Boolean = false;
+  private var callsThisRound: Int = 0;
+  private var pendingRuns: List<ToolRun> = [];
+
+  public get history(): List<Message> { messages.toList() }
+  public get attemptsSoFar(): List<Attempt> { attempts.toList() }
+  public get currentRound(): Int { round }
+  // the candidate that would be handed back if the loop gave up now
+  public get draft(): Draft? { kept }
+  // the sentences of the last refusal, cut-off or transport failure
+  public get lastProblems(): List<String> { problems }
+  // every tool offered, across the buckets
+  public get tools(): List<FunctionTool> {
+    let out = new ListBuilder<FunctionTool>();
+    for (var i = 0; i < buckets.length; i += 1) { out.addAll(buckets[i].tools); }
+    out.toList()
+  }
+
+  public next(event: Event): Step {
+    when (event) {
+      is Start -> do {
+        messages.add(new SystemMessage(systemPrompt));
+        messages.add(UserMessage.fromText(opening));
+        if (round > policy.rounds) { giveUp(GiveUpCauses.outOfRounds) } else { new SendRequest(buildRequest()) }
+      };
+      is TransportFailed -> do {
+        let why = script.transportRecord(event.why, event.kind);
+        record(null, [], why);
+        problems = [why];
+        giveUp(GiveUpCauses.transportFailed)
+      };
+      is Responded -> onResponse(event.response);
+      is ToolsRan -> onToolsRan(event.results);
+      is CheckPassed -> do {
+        let c = checked();
+        record(c.summary, c.edits, null);
+        new Done(c, attempts.toList())
+      };
+      is CheckRefused -> do {
+        let c = checked();
+        if (policy.keepDraft && event.keep) { kept = new Draft(c, event.problems); }
+        failRound(c.summary, c.edits, script.refusedRecord(event.problems), script.refusedTurn(event.problems), event.problems)
+      };
+    }
+  }
+
+  // The candidate the host was asked to check. A CheckPassed or CheckRefused
+  // with no Check outstanding is the host's bug, not a state to recover from.
+  private checked(): Candidate {
+    let c = pendingCandidate;
+    if (c == null) { panic() } else { c }
+  }
+
+  // One round as the record keeps it, with the tool calls it made.
+  private record(summary: String?, edits: List<Edit>, error: String?): Void {
+    attempts.add(new Attempt(round, summary, edits, error, null, callsThisRound));
+  }
+
+  private buildRequest(): ChatRequest {
+    let extra = new MapBuilder<String, JsonSyntaxTree>();
+    let chosen = effort;
+    if (chosen != null) { extra["reasoning_effort"] = new JsonString(chosen); }
+    let offered = tools;
+    // tool_choice is only written when there are tools to choose from
+    let choice: ToolChoice? = if (toolsClosed && !offered.isEmpty) { new NoToolChoice() } else { null };
+    {
+      class: ChatRequest,
+      model: model,
+      messages: messages.toList(),
+      tools: offered,
+      toolChoice: choice,
+      temperature: policy.temperature,
+      maxTokens: policy.maxTokens,
+      extra: extra.toMap(),
+    }
+  }
+
+  // A new round: the tool budget starts over.
+  private nextRound(): Void {
+    round += 1;
+    toolTurnsUsed = 0;
+    toolsClosed = false;
+    callsThisRound = 0;
+    pendingRuns = [];
+  }
+
+  private onResponse(response: ChatResponse): Step {
+    // A 200 with no choices is not a cut-off; there is nothing to ask
+    // again for. Jam Pilot treated it as a transport failure: one attempt,
+    // no second request. (ChatResponse.text is null for it too, which is
+    // what the cut-off rule below would read as "before any answer".)
+    if (response.choices.isEmpty) {
+      let why = "the model answered with no choices";
+      record(null, [], why);
+      problems = [why];
+      return giveUp(GiveUpCauses.transportFailed);
+    }
+    let message = response.choices[0].message;
+    let replyOrNull = response.text;
+    // The model spent its budget thinking and the reply came back cut in
+    // half, or nothing came back. Tool calls in a cut-off reply are not
+    // calls: a cut-off is a cut-off.
+    if (response.finishReason == FinishReasons.length || (replyOrNull == null && !message.hasToolCalls)) {
+      let usage = response.usage;
+      let reasoning: Int? = if (usage == null) { null } else { usage.reasoningTokens };
+      let why = script.cutOffRecord(reasoning, policy.maxTokens, replyOrNull == null);
+      record(null, [], why);
+      problems = [why];
+      if (!policy.retryCutOff) { return giveUp(GiveUpCauses.cutOff); }
+      // ask again, as the script says, at the cut-off effort; the cut-off
+      // reply itself is not added to the conversation
+      nextRound();
+      if (round > policy.rounds) { return giveUp(GiveUpCauses.outOfRounds); }
+      messages.add(UserMessage.fromText(script.cutOffTurn(why)));
+      effort = policy.cutOffEffort;
+      return new SendRequest(buildRequest());
+    }
+    if (message.hasToolCalls) { return toolTurn(message); }
+    let reply = replyOrNull ?? "";
+    pendingReply = reply;
+    let noted = new Problems();
+    let proposal: Proposal? = reader.read(reply, noted) orelse null;
+    if (proposal == null) {
+      failRound(null, [], unreadable(noted), script.unreadableTurn(noted.messages), noted.messages)
+    } else {
+      let text: String? = reader.realize(proposal, noted) orelse null;
+      if (text == null) {
+        failRound(proposal.summary, proposal.edits, unreadable(noted), script.unreadableTurn(noted.messages), noted.messages)
+      } else {
+        let candidate = new Candidate(text, proposal.summary, proposal.edits);
+        pendingCandidate = candidate;
+        new Check(candidate)
+      }
+    }
+  }
+
+  // The model asked for tools. Its turn goes into the conversation as it
+  // came, content and calls; a call naming no offered tool is answered
+  // here with the names there are; the rest go to the host. After the
+  // tools were closed, a call is a failed round, and the turn goes in
+  // without its calls (a provider refuses calls with no results after them).
+  private toolTurn(message: AssistantMessage): Step {
+    callsThisRound += message.toolCalls.length;
+    if (toolsClosed) {
+      pendingReply = message.content ?? "";
+      let why = script.toolsAfterCloseRecord();
+      return failRound(null, [], why, script.unreadableTurn([why]), [why]);
+    }
+    messages.add(message);
+    toolTurnsUsed += 1;
+    let runs = new ListBuilder<ToolRun>();
+    let calls = message.toolCalls;
+    for (var i = 0; i < calls.length; i += 1) {
+      let call = calls[i];
+      let bucket = bucketOf(call.name);
+      if (bucket == null) {
+        messages.add(new ToolMessage(call.id, noSuchTool(call.name)));
+      } else {
+        runs.add(new ToolRun(call, bucket));
+      }
+    }
+    pendingRuns = runs.toList();
+    if (pendingRuns.isEmpty) { afterTools() } else { new RunTools(pendingRuns) }
+  }
+
+  // The host ran the tools: one result per run, in the runs' order. A
+  // ToolsRan with no RunTools outstanding, or without a run's result, is
+  // the host's bug.
+  private onToolsRan(results: List<ToolResult>): Step {
+    let runs = pendingRuns;
+    if (runs.isEmpty) { panic(); }
+    for (var i = 0; i < runs.length; i += 1) {
+      let call = runs[i].call;
+      messages.add(new ToolMessage(call.id, resultFor(results, call.id)));
+    }
+    pendingRuns = [];
+    afterTools()
+  }
+
+  // The next request after a tool turn, with the tools closed and the
+  // answer asked for once the round's turns are spent.
+  private afterTools(): Step {
+    if (!toolsClosed && toolTurnsUsed >= toolTurns) {
+      toolsClosed = true;
+      messages.add(UserMessage.fromText(script.toolsExhaustedTurn(toolTurns)));
+    }
+    new SendRequest(buildRequest())
+  }
+
+  private resultFor(results: List<ToolResult>, callId: String): String {
+    for (var i = 0; i < results.length; i += 1) {
+      if (results[i].callId == callId) { return results[i].content; }
+    }
+    panic()
+  }
+
+  // The name of the bucket holding this tool, or null for a name no bucket has.
+  private bucketOf(toolName: String): String? {
+    for (var i = 0; i < buckets.length; i += 1) {
+      if (buckets[i].has(toolName)) { return buckets[i].name; }
+    }
+    null
+  }
+
+  private noSuchTool(toolName: String): String {
+    let names = tools.map { (t): String => t.name }.join(", ") { it => it };
+    "There is no tool named \"${toolName}\". The tools are: ${names}."
+  }
+
+  // A reader that bubbles without saying why is a bug in the reader.
+  private unreadable(noted: Problems): String {
+    if (noted.isEmpty) { panic() }
+    script.unreadableRecord(noted.messages)
+  }
+
+  // The model's reply did not do: record the round, and if a round is left,
+  // put the reply and the complaint into the conversation and ask again.
+  private failRound(summary: String?, edits: List<Edit>, error: String, turn: String, why: List<String>): Step {
+    record(summary, edits, error);
+    problems = why;
+    let reply = pendingReply;
+    pendingReply = "";
+    pendingCandidate = null;
+    nextRound();
+    if (round > policy.rounds) { return giveUp(GiveUpCauses.outOfRounds); }
+    messages.add(new AssistantMessage(reply));
+    messages.add(UserMessage.fromText(turn));
+    effort = policy.retryEffort;
+    new SendRequest(buildRequest())
+  }
+
+  private giveUp(cause: String): Step {
+    new GaveUp(attempts.toList(), kept, problems, cause)
+  }
+}

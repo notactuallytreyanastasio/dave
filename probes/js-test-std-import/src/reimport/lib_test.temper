@@ -1,0 +1,9 @@
+// Test file that imports parseJson AGAIN. On js the extracted test file
+// then has no import for it: ReferenceError, reported as a bubble.
+let { parseJson } = import("std/json");
+
+let run(test: Test): Void {
+  let t = parseJson("{\"a\":1}") orelse panic();
+  assert(isObject(t)) { "not an object" }
+}
+test("reimport: test file imports parseJson again") { test => run(test); }

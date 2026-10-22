@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# The Temper CLI with the Elixir backend, built from ../temper-elixir/temper.
+# Same wrapper as bin/temper, different checkout: upstream has no be-elixir.
+#
+# `temper` is not on PATH. This runs the CLI built from the sibling checkout
+# (../temper, or $TEMPER_HOME) on the JDK it needs. The system `java` on this
+# machine is a stub that says "Unable to locate a Java Runtime"; the Homebrew
+# OpenJDK 21 works. Rebuild the CLI with /temper-upgrade when ../temper moves.
+set -euo pipefail
+
+root=$(cd "$(dirname "$0")/.." && pwd)
+TEMPER_HOME=${TEMPER_ELIXIR_HOME:-$root/../temper-elixir/temper}
+cli="$TEMPER_HOME/cli/build/install/temper/bin/temper"
+
+if [ ! -x "$cli" ]; then
+  echo "bin/temper: no CLI at $cli" >&2
+  echo "  build it: (cd $TEMPER_HOME && JAVA_HOME=<jdk21> ./gradlew :cli:installDist)" >&2
+  exit 127
+fi
+
+if [ -z "${JAVA_HOME:-}" ] || [ ! -x "$JAVA_HOME/bin/java" ]; then
+  for j in \
+    /opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home \
+    /opt/homebrew/opt/openjdk/libexec/openjdk.jdk/Contents/Home \
+    /usr/local/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home; do
+    if [ -x "$j/bin/java" ]; then export JAVA_HOME=$j; break; fi
+  done
+fi
+if [ -z "${JAVA_HOME:-}" ] || [ ! -x "$JAVA_HOME/bin/java" ]; then
+  echo "bin/temper: no JDK found; set JAVA_HOME (brew install openjdk@21)" >&2
+  exit 127
+fi
+export PATH="$JAVA_HOME/bin:$PATH"
+
+exec "$cli" "$@"

@@ -1,0 +1,174 @@
+// Tool definitions, tool choice and response format.
+//
+// A tool's `parameters` is a JSON Schema and stays a JsonSyntaxTree: the
+// schema is the host's contract with the model, this library carries it
+// without interpreting it. (A schema checker belongs with the eval scorers.)
+
+let { JsonProducer, JsonSyntaxTree, JsonString, JsonObject } = import("std/json");
+
+export class FunctionTool(
+  public name: String,
+  public description: String? = null,
+  public parameters: JsonSyntaxTree? = null,
+  public strict: Boolean? = null,
+) {
+  public encodeToJson(p: JsonProducer): Void {
+    p.startObject();
+    p.objectKey("type"); p.stringValue("function");
+    p.objectKey("function");
+    p.startObject();
+    p.objectKey("name"); p.stringValue(name);
+    keyStringOrSkip(p, "description", description);
+    let params = parameters;
+    if (params != null) { p.objectKey("parameters"); params.produce(p); }
+    keyBooleanOrSkip(p, "strict", strict);
+    p.endObject();
+    p.endObject();
+  }
+
+  public static decode(t: JsonSyntaxTree, path: String, problems: Problems): FunctionTool throws Bubble {
+    let o = Obj.at(t, path, problems);
+    let kind = o.string("type");
+    if (kind != "function") { o.fail("type", "unknown tool type \"${kind}\""); }
+    let f = o.obj("function");
+    let params = f.raw("parameters");
+    if (params != null && !(params is JsonObject)) {
+      f.fail("parameters", "expected object (a JSON Schema), got ${kindOf(params)}");
+    }
+    new FunctionTool(f.string("name"), f.stringOrNull("description"), params, f.booleanOrNull("strict"))
+  }
+}
+
+let decodeTools(elements: List<JsonSyntaxTree>, path: String, problems: Problems): List<FunctionTool> throws Bubble {
+  let out = new ListBuilder<FunctionTool>();
+  var i = 0;
+  while (i < elements.length) {
+    out.add(FunctionTool.decode(elements[i], "${path}[${i}]", problems));
+    i += 1;
+  }
+  out.toList()
+}
+
+// Tool names: 1-64 characters from [A-Za-z0-9_-]. Checked by hand rather
+// than with std/regex so every backend agrees to the character.
+export let isValidToolName(name: String): Boolean {
+  var i = String.begin;
+  var count = 0;
+  while (name.hasIndex(i)) {
+    let c = name[i];
+    let ok = (c >= char'a' && c <= char'z')
+      || (c >= char'A' && c <= char'Z')
+      || (c >= char'0' && c <= char'9')
+      || c == char'_' || c == char'-';
+    if (!ok) { return false; }
+    count += 1;
+    i = name.next(i);
+  }
+  count >= 1 && count <= 64
+}
+
+// ---------- Tool choice ----------
+
+export sealed interface ToolChoice {
+  public encodeToJson(p: JsonProducer): Void;
+}
+
+export class AutoToolChoice extends ToolChoice {
+  public encodeToJson(p: JsonProducer): Void { p.stringValue("auto"); }
+}
+
+export class NoToolChoice extends ToolChoice {
+  public encodeToJson(p: JsonProducer): Void { p.stringValue("none"); }
+}
+
+export class RequiredToolChoice extends ToolChoice {
+  public encodeToJson(p: JsonProducer): Void { p.stringValue("required"); }
+}
+
+export class NamedToolChoice(public name: String) extends ToolChoice {
+  public encodeToJson(p: JsonProducer): Void {
+    p.startObject();
+    p.objectKey("type"); p.stringValue("function");
+    p.objectKey("function");
+    p.startObject();
+    p.objectKey("name"); p.stringValue(name);
+    p.endObject();
+    p.endObject();
+  }
+}
+
+let decodeToolChoice(t: JsonSyntaxTree, path: String, problems: Problems): ToolChoice throws Bubble {
+  when (t) {
+    is JsonString -> when (t.content) {
+      "auto" -> new AutoToolChoice();
+      "none" -> new NoToolChoice();
+      "required" -> new RequiredToolChoice();
+      else -> do { problems.add(path, "unknown tool_choice \"${t.content}\""); bubble() }
+    };
+    is JsonObject -> do {
+      let o = Obj.at(t, path, problems);
+      let kind = o.string("type");
+      if (kind != "function") { o.fail("type", "unknown tool_choice type \"${kind}\""); }
+      new NamedToolChoice(o.obj("function").string("name"))
+    };
+    else -> do { problems.add(path, "expected string or object, got ${kindOf(t)}"); bubble() }
+  }
+}
+
+// ---------- Response format ----------
+
+export sealed interface ResponseFormat {
+  public encodeToJson(p: JsonProducer): Void;
+}
+
+export class TextFormat extends ResponseFormat {
+  public encodeToJson(p: JsonProducer): Void {
+    p.startObject(); p.objectKey("type"); p.stringValue("text"); p.endObject();
+  }
+}
+
+export class JsonObjectFormat extends ResponseFormat {
+  public encodeToJson(p: JsonProducer): Void {
+    p.startObject(); p.objectKey("type"); p.stringValue("json_object"); p.endObject();
+  }
+}
+
+export class JsonSchemaFormat(
+  public name: String,
+  public schema: JsonSyntaxTree,
+  public strict: Boolean? = null,
+  public description: String? = null,
+) extends ResponseFormat {
+  public encodeToJson(p: JsonProducer): Void {
+    p.startObject();
+    p.objectKey("type"); p.stringValue("json_schema");
+    p.objectKey("json_schema");
+    p.startObject();
+    p.objectKey("name"); p.stringValue(name);
+    keyStringOrSkip(p, "description", description);
+    p.objectKey("schema"); schema.produce(p);
+    keyBooleanOrSkip(p, "strict", strict);
+    p.endObject();
+    p.endObject();
+  }
+}
+
+let decodeResponseFormat(t: JsonSyntaxTree, path: String, problems: Problems): ResponseFormat throws Bubble {
+  let o = Obj.at(t, path, problems);
+  let kind = o.string("type");
+  when (kind) {
+    "text" -> new TextFormat();
+    "json_object" -> new JsonObjectFormat();
+    "json_schema" -> do {
+      let js = o.obj("json_schema");
+      let schema = js.raw("schema");
+      if (schema == null) {
+        js.fail("schema", "required");
+        bubble()
+      } else {
+        new JsonSchemaFormat(js.string("name"), schema, js.booleanOrNull("strict"), js.stringOrNull("description"))
+      }
+    };
+    else -> do { o.fail("type", "unknown response_format type \"${kind}\""); bubble() }
+  }
+}

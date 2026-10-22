@@ -1,0 +1,60 @@
+sealed interface I {}
+class A extends I {}
+class B(public flag: Boolean) extends I {}
+
+let bareIfArm(m: I): String {
+  let out = new ListBuilder<String>();
+  when (m) {
+    is B -> if (m.flag) { out.add("b"); };
+    is A -> void;
+  }
+  out.join(",") { it => it }
+}
+
+let doBlockArm(m: I): String {
+  let out = new ListBuilder<String>();
+  when (m) {
+    is B -> do { if (m.flag) { out.add("b"); } };
+    is A -> void;
+  }
+  out.join(",") { it => it }
+}
+
+// Variant 3: the arm is a call; the `if` lives in a helper.
+let addIfFlag(m: B, out: ListBuilder<String>): Void {
+  if (m.flag) { out.add("b"); }
+}
+let helperArm(m: I): String {
+  let out = new ListBuilder<String>();
+  when (m) {
+    is B -> addIfFlag(m, out);
+    is A -> void;
+  }
+  out.join(",") { it => it }
+}
+
+// Variant 4: the inner `if` carries its own `else`.
+let ifElseArm(m: I): String {
+  let out = new ListBuilder<String>();
+  when (m) {
+    is B -> if (m.flag) { out.add("b"); } else { void };
+    is A -> void;
+  }
+  out.join(",") { it => it }
+}
+
+let run(test: Test, which: String, f: fn (I): String): Void {
+  let items: List<I> = [new A(), new B(true), new B(false)];
+  var i = 0;
+  while (i < items.length) {
+    let got = f(items[i]) orelse "THREW";
+    console.log("${which} item ${i}: ${got}");
+    assert(got != "THREW") { "${which}: item ${i} threw" }
+    i += 1;
+  }
+}
+
+test("bare if as a when arm") { test => run(test, "bare-if", bareIfArm); }
+test("do block as a when arm") { test => run(test, "do-block", doBlockArm); }
+test("helper call as a when arm") { test => run(test, "helper", helperArm); }
+test("if-else as a when arm") { test => run(test, "if-else", ifElseArm); }

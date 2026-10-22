@@ -1,0 +1,181 @@
+// A streamed reply, assembled into the ChatResponse a whole reply gives.
+//
+// With `"stream": true` the provider answers with server-sent events: lines
+// of `data: {chunk}`, each chunk's `choices[0].delta` holding a piece of
+// `reasoning_content` or `content`, the last chunk `finish_reason`, then
+// `data: [DONE]`. The host reads the socket and hands each frame to
+// `feed`; a frame can end in the middle of a line, so the unfinished line
+// waits in the buffer for the next frame. `finish` builds the same
+// ChatResponse `parseChatResponse` builds from a whole reply, so a host
+// that streams and a host that does not feed the same `Responded` event.
+//
+// This is Jam Pilot's `parse_sse` (notedance_viewer, lib/dave/hotfix/glm.ex),
+// with two additions: a chunk's `usage` is kept (Fireworks sends it on the
+// final chunk when asked with `stream_options.include_usage`), and a
+// malformed chunk is a problem that bubbles, not a chunk that is ignored.
+// The HTTP status is the host's business: a non-200 body is not SSE and
+// never reaches this class.
+
+let {
+  JsonSyntaxTree, JsonObject, parseJson,
+} = import("std/json");
+
+// One piece of the reply as it arrived, for a host that shows the model
+// thinking. ContentDelta text is what `finish` joins into the answer.
+export sealed interface Delta {
+  public get text(): String;
+}
+export class ReasoningDelta(public text: String) extends Delta {}
+export class ContentDelta(public text: String) extends Delta {}
+
+export class StreamAssembler {
+  // The unfinished last line of the previous frame.
+  private var buffer: String = "";
+  private content: ListBuilder<String> = new ListBuilder<String>();
+  // Not `finish`: a field with the same name as the `finish()` method
+  // reads as the method on interp and as the field on js/py, and the
+  // response came out without its finish_reason (probes/interp-field-vs-method).
+  private var finishSeen: String? = null;
+  private var usageSeen: Usage? = null;
+  private var id: String? = null;
+  private var model: String? = null;
+  private var created: Int64? = null;
+  private var systemFingerprint: String? = null;
+  private problems: Problems = new Problems();
+
+  // The answer so far: every content delta joined. Empty until the model
+  // stops thinking; `finish` turns an empty answer into null content.
+  public get contentSoFar(): String { content.join("") { it => it } }
+  public get hasContent(): Boolean { !content.isEmpty }
+  // The last non-null finish_reason seen, null until the final chunk.
+  public get finishReason(): String? { finishSeen }
+  public get usage(): Usage? { usageSeen }
+  // The partial line waiting for the next frame.
+  public get pending(): String { buffer }
+  // Why `feed` bubbled, as "<json path>: <why>" lines.
+  public get lastProblems(): List<String> { problems.messages }
+  public get lastError(): String? { problems.first }
+
+  // One frame of the stream. Returns the deltas it completed, in order,
+  // empty strings skipped. Bubbles when a data line is JSON that is not a
+  // chunk this library can read (a delta with tool_calls, a usage object
+  // with a string where a number belongs, an {"error": ...} object); the
+  // reason is in `lastError` and the frame's lines up to the bad one are
+  // already applied.
+  public feed(chunk: String): List<Delta> throws Bubble {
+    let lines = "${buffer}${chunk}".split("\n");
+    // The last piece has no "\n" after it yet; it may be "" after a frame
+    // that ended on a line break, which is the common case.
+    buffer = lines[lines.length - 1];
+    let out = new ListBuilder<Delta>();
+    var i = 0;
+    while (i < lines.length - 1) {
+      feedLine(dropTrailingCr(lines[i]), out);
+      i += 1;
+    }
+    out.toList()
+  }
+
+  // The reply as one ChatResponse. Content is null when no content delta
+  // arrived, which is what RepairAgent reads as "cut off before any
+  // answer"; a cut-off with partial content keeps the content and
+  // finish_reason "length", like a whole reply would.
+  public finish(): ChatResponse {
+    let text: String? = if (content.isEmpty) { null } else { contentSoFar };
+    new ChatResponse(
+      id ?? "",
+      model ?? "",
+      [new Choice(0, new AssistantMessage(text), finishSeen)],
+      created,
+      usageSeen,
+      systemFingerprint,
+    )
+  }
+
+  private feedLine(line: String, out: ListBuilder<Delta>): Void throws Bubble {
+    // Anything but a data line is ignored: SSE comments (": keep-alive"),
+    // "event:" lines, blank separators.
+    // An early `return` does not narrow what follows it, so the nulls
+    // nest instead.
+    let payloadOrNull = afterPrefix(line, "data:");
+    if (payloadOrNull != null) {
+      let payload = trimSpaces(payloadOrNull);
+      if (payload != "[DONE]") {
+        // Not JSON: ignored, as Jam Pilot ignored it.
+        let tree: JsonSyntaxTree? = parseJson(payload) orelse null;
+        if (tree != null) { feedChunk(tree, out); }
+      }
+    }
+  }
+
+  private feedChunk(tree: JsonSyntaxTree, out: ListBuilder<Delta>): Void throws Bubble {
+    problems.clear();
+    let o = Obj.at(tree, "$", problems);
+    let err = o.raw("error");
+    if (err != null) {
+      let e = ApiError.decode(err, o.child("error"), problems);
+      problems.add("$.error", e.describe());
+      bubble();
+    }
+    let idNow = o.stringOrNull("id");
+    if (idNow != null) { id = idNow; }
+    let modelNow = o.stringOrNull("model");
+    if (modelNow != null) { model = modelNow; }
+    let createdNow = o.int64OrNull("created");
+    if (createdNow != null) { created = createdNow; }
+    let fp = o.stringOrNull("system_fingerprint");
+    if (fp != null) { systemFingerprint = fp; }
+    let usageTree = o.raw("usage");
+    if (usageTree != null) { usageSeen = Usage.decode(usageTree, o.child("usage"), problems); }
+    let choices = o.listOrEmpty("choices");
+    if (!choices.isEmpty) {
+      let choice = Obj.at(choices[0], "${o.child("choices")}[0]", problems);
+      let finishNow = choice.stringOrNull("finish_reason");
+      if (finishNow != null) { finishSeen = finishNow; }
+      let delta = choice.objOrNull("delta");
+      if (delta != null) { feedDelta(delta, out); }
+    }
+  }
+
+  private feedDelta(delta: Obj, out: ListBuilder<Delta>): Void throws Bubble {
+    if (delta.has("tool_calls")) {
+      delta.fail("tool_calls", "streamed tool calls are not assembled yet");
+    }
+    // Absent, null and "" are all "nothing here": the empty-string skip is
+    // Jam Pilot's, and it keeps a host's typewriter from printing nothing.
+    let reasoning = delta.stringOrNull("reasoning_content") ?? "";
+    if (!reasoning.isEmpty) { out.add(new ReasoningDelta(reasoning)); }
+    let text = delta.stringOrNull("content") ?? "";
+    if (!text.isEmpty) {
+      out.add(new ContentDelta(text));
+      content.add(text);
+    }
+  }
+}
+
+// The rest of s after prefix, or null when s does not start with it.
+let afterPrefix(s: String, prefix: String): String? {
+  let n = prefix.countBetween(String.begin, prefix.end);
+  if (!s.hasAtLeast(String.begin, s.end, n)) { return null; }
+  let cut = s.step(String.begin, n);
+  if (s.slice(String.begin, cut) == prefix) { s.slice(cut, s.end) } else { null }
+}
+
+// A line that ended in "\r\n" has its "\r" left on it after the split.
+let dropTrailingCr(line: String): String {
+  if (line.isEmpty) { return line; }
+  let last = line.prev(line.end);
+  if (line[last] == char'\r') { line.slice(String.begin, last) } else { line }
+}
+
+// Spaces and tabs off both ends: "data: {..}" has one space after the colon,
+// and a "\r" may already be gone.
+let trimSpaces(s: String): String {
+  var a = String.begin;
+  while (s.hasIndex(a) && isSpace(s[a])) { a = s.next(a); }
+  var b = s.end;
+  while (b != a && isSpace(s[s.prev(b)])) { b = s.prev(b); }
+  s.slice(a, b)
+}
+
+let isSpace(cp: Int): Boolean { cp == char' ' || cp == char'\t' || cp == char'\r' }

@@ -1,0 +1,276 @@
+// Tests for the chat module. They live in the module so they can reach
+// its internals without exporting them to every host language.
+//
+// Every check runs inside a function that takes the Test, with inputs
+// parsed from strings at run time, so the frontend cannot fold them and
+// the backend's own code is what runs.
+//
+// No std import here on purpose. The files of a module share one scope,
+// so the library files' import bindings (parseJson, JsonObject...) are
+// visible; and a second import of a std *function* in a test file makes
+// the js backend drop it from the extracted test file, which then fails
+// with a ReferenceError disguised as a bubble. See probes/js-test-std-import.
+
+let schemaText = "{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\"}},\"required\":[\"city\"]}";
+
+let sampleRequest(): ChatRequest {
+  let schema = parseJson(schemaText) orelse panic();
+  {
+    class: ChatRequest,
+    model: "gpt-4o-mini",
+    messages: [
+      new SystemMessage("Be terse."),
+      UserMessage.fromText("What is the weather in Oslo?"),
+      new AssistantMessage(null, [new ToolCall("call_1", "get_weather", "{\"city\":\"Oslo\"}")]),
+      new ToolMessage("call_1", "{\"temp_c\":7}"),
+    ],
+    tools: [new FunctionTool("get_weather", "Current weather", schema)],
+    toolChoice: new AutoToolChoice(),
+    temperature: 0.2,
+    maxTokens: 256,
+  }
+}
+
+let firstProblem(p: Problems): String { p.first ?? "<no problems>" }
+
+let lines(xs: List<String>): String { xs.join(" | ") { it => it } }
+
+// ---------- encoding ----------
+
+let runEncodeRequest(test: Test): Void {
+  let text = sampleRequest().toJsonText() orelse "<encode failed>";
+  assert(text == "{\"model\":\"gpt-4o-mini\",\"messages\":[{\"role\":\"system\",\"content\":\"Be terse.\"},{\"role\":\"user\",\"content\":\"What is the weather in Oslo?\"},{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\":\\\"Oslo\\\"}\"}}]},{\"role\":\"tool\",\"tool_call_id\":\"call_1\",\"content\":\"{\\\"temp_c\\\":7}\"}],\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"description\":\"Current weather\",\"parameters\":{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\"}},\"required\":[\"city\"]}}}],\"tool_choice\":\"auto\",\"temperature\":0.2,\"max_tokens\":256}") { text }
+}
+test("encode a request with tools and a tool round trip") { test => runEncodeRequest(test); }
+
+let runEncodeParts(test: Test): Void {
+  let m = new UserMessage([new TextPart("Describe"), new ImagePart("https://x/img.png", "low")]);
+  let text = jsonTextOf(m);
+  assert(text == "{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"Describe\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"https://x/img.png\",\"detail\":\"low\"}}]}") { text }
+  let problems = new Problems();
+  let back = decodeMessage(parseJson(text) orelse panic(), "$", problems) orelse panic();
+  when (back) {
+    is UserMessage -> do {
+      assert(back.parts.length == 2);
+      assert(back.text == "Describe");
+      assert(back.parts[1] is ImagePart);
+    };
+    else -> assert(false) { "decoded to ${back.role}" };
+  }
+}
+test("user content parts encode as an array and decode back") { test => runEncodeParts(test); }
+
+let jsonTextOf(m: Message): String {
+  jsonText { (p): Void => m.encodeToJson(p); } orelse "<encode failed>"
+}
+
+// ---------- decoding responses ----------
+
+let runDecodeHello(test: Test): Void {
+  let problems = new Problems();
+  let r = parseChatResponse("{\"id\":\"chatcmpl-123\",\"object\":\"chat.completion\",\"created\":1677652288,\"model\":\"gpt-4o-mini\",\"system_fingerprint\":\"fp_44709d6fcb\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"\\n\\nHello there, how may I assist you today?\"},\"logprobs\":null,\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":12,\"total_tokens\":21}}", problems) orelse panic();
+  assert(problems.isEmpty) { problems.summary() }
+  assert(r.id == "chatcmpl-123");
+  assert(r.model == "gpt-4o-mini");
+  assert(r.created == 1677652288i64);
+  assert(r.systemFingerprint == "fp_44709d6fcb");
+  assert(r.text == "\n\nHello there, how may I assist you today?");
+  assert(r.finishReason == "stop");
+  assert(r.toolCalls.isEmpty);
+  let u = r.usage;
+  if (u == null) { assert(false) { "usage missing" } } else {
+    assert(u.promptTokens == 9);
+    assert(u.totalTokens == 21);
+  }
+}
+test("decode a plain completion") { test => runDecodeHello(test); }
+
+let runDecodeToolCall(test: Test): Void {
+  let problems = new Problems();
+  let r = parseChatResponse("{\"id\":\"chatcmpl-abc\",\"object\":\"chat.completion\",\"created\":1699896916,\"model\":\"gpt-4o-mini\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"call_abc123\",\"type\":\"function\",\"function\":{\"name\":\"get_current_weather\",\"arguments\":\"{\\n\\\"location\\\": \\\"Boston, MA\\\"\\n}\"}}]},\"logprobs\":null,\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":82,\"completion_tokens\":17,\"total_tokens\":99}}", problems) orelse panic();
+  assert(problems.isEmpty) { problems.summary() }
+  assert(r.text == null);
+  assert(r.finishReason == "tool_calls");
+  assert(r.toolCalls.length == 1);
+  let call = r.toolCalls[0];
+  assert(call.id == "call_abc123");
+  assert(call.name == "get_current_weather");
+  let args = call.argumentsTree(problems) orelse panic();
+  when (args) {
+    is JsonObject -> do {
+      let loc = args.propertyValueOrNull("location");
+      when (loc) {
+        is JsonString -> assert(loc.content == "Boston, MA");
+        else -> assert(false) { "location missing" };
+      }
+    };
+    else -> assert(false) { "arguments not an object" };
+  }
+  // Re-encoding drops logprobs and keeps everything this library models.
+  let again = r.toJsonText() orelse "<encode failed>";
+  assert(again == "{\"id\":\"chatcmpl-abc\",\"object\":\"chat.completion\",\"created\":1699896916,\"model\":\"gpt-4o-mini\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"call_abc123\",\"type\":\"function\",\"function\":{\"name\":\"get_current_weather\",\"arguments\":\"{\\n\\\"location\\\": \\\"Boston, MA\\\"\\n}\"}}]},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":82,\"completion_tokens\":17,\"total_tokens\":99}}") { again }
+  let r2 = parseChatResponse(again, problems) orelse panic();
+  assert((r2.toJsonText() orelse "?") == again);
+}
+test("decode a tool call response and round-trip it") { test => runDecodeToolCall(test); }
+
+let expectProblem(test: Test, text: String, want: String): Void {
+  let problems = new Problems();
+  parseChatResponse(text, problems) orelse new ChatResponse("", "", []);
+  let got = firstProblem(problems);
+  assert(got == want) { "want `${want}` got `${got}`" }
+}
+
+let runResponseProblems(test: Test): Void {
+  expectProblem(test, "not json", "$: not valid JSON");
+  expectProblem(test, "[1,2]", "$: expected object, got array");
+  expectProblem(test, "{\"id\":\"x\",\"model\":\"m\"}", "$.choices: expected array, got absent");
+  expectProblem(test, "{\"id\":\"x\",\"model\":\"m\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"user\",\"content\":\"hi\"}}]}",
+    "$.choices[0].message.role: expected \"assistant\", got \"user\"");
+  expectProblem(test, "{\"id\":\"x\",\"model\":\"m\",\"choices\":[{\"index\":\"zero\",\"message\":{\"role\":\"assistant\",\"content\":\"hi\"}}]}",
+    "$.choices[0].index: expected number, got string");
+  expectProblem(test, "{\"id\":\"x\",\"model\":\"m\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"c\",\"type\":\"function\",\"function\":{\"name\":\"f\"}}]}}]}",
+    "$.choices[0].message.tool_calls[0].function.arguments: expected string, got absent");
+  expectProblem(test, "{\"error\":{\"message\":\"Incorrect API key provided\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":\"invalid_api_key\"}}", "$.error: Incorrect API key provided (invalid_request_error, invalid_api_key)");
+}
+test("response problems name the JSON path and the reason") { test => runResponseProblems(test); }
+
+let runApiError(test: Test): Void {
+  let e = parseApiError("{\"error\":{\"message\":\"Incorrect API key provided\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":\"invalid_api_key\"}}");
+  if (e == null) { assert(false) { "no error parsed" } } else {
+    assert(e.message == "Incorrect API key provided");
+    assert(e.code == "invalid_api_key");
+    assert(e.param == null);
+  }
+  let none = parseApiError("{\"id\":\"x\"}");
+  assert(none == null) { "parsed an error from a non-error body" }
+  let junk = parseApiError("nope");
+  assert(junk == null) { "parsed an error from junk" }
+}
+test("parseApiError reads an error body and nothing else") { test => runApiError(test); }
+
+// ---------- decoding requests ----------
+
+let runDecodeRequest(test: Test): Void {
+  let problems = new Problems();
+  let r = parseChatRequest("{\"model\":\"gpt-4o-mini\",\"messages\":[{\"role\":\"system\",\"content\":\"Be terse.\"},{\"role\":\"user\",\"content\":\"What is the weather in Oslo?\"},{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\":\\\"Oslo\\\"}\"}}]},{\"role\":\"tool\",\"tool_call_id\":\"call_1\",\"content\":\"{\\\"temp_c\\\":7}\"}],\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"description\":\"Current weather\",\"parameters\":{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\"}},\"required\":[\"city\"]}}}],\"tool_choice\":\"auto\",\"temperature\":0.2,\"max_tokens\":256}", problems) orelse panic();
+  assert(problems.isEmpty) { problems.summary() }
+  assert(r.model == "gpt-4o-mini");
+  assert(r.messages.length == 4);
+  assert(r.messages[0] is SystemMessage);
+  assert(r.messages[1] is UserMessage);
+  let third = r.messages[2];
+  when (third) {
+    is AssistantMessage -> do {
+      assert(third.content == null);
+      assert(third.toolCalls.length == 1);
+      assert(third.toolCalls[0].arguments == "{\"city\":\"Oslo\"}");
+    };
+    else -> assert(false) { "messages[2] is ${third.role}" };
+  }
+  assert(r.messages[3] is ToolMessage);
+  assert(r.tools.length == 1 && r.tools[0].name == "get_weather");
+  assert(r.toolChoice is AutoToolChoice);
+  assert(r.temperature == 0.2);
+  assert(r.maxTokens == 256);
+  assert(r.topP == null);
+  assert((r.toJsonText() orelse "?") == "{\"model\":\"gpt-4o-mini\",\"messages\":[{\"role\":\"system\",\"content\":\"Be terse.\"},{\"role\":\"user\",\"content\":\"What is the weather in Oslo?\"},{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\":\\\"Oslo\\\"}\"}}]},{\"role\":\"tool\",\"tool_call_id\":\"call_1\",\"content\":\"{\\\"temp_c\\\":7}\"}],\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"description\":\"Current weather\",\"parameters\":{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\"}},\"required\":[\"city\"]}}}],\"tool_choice\":\"auto\",\"temperature\":0.2,\"max_tokens\":256}");
+
+  // Unknown keys survive in `extra` and are re-emitted.
+  let withExtra = "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"reasoning_effort\":\"low\"}";
+  let r2 = parseChatRequest(withExtra, problems) orelse panic();
+  assert(r2.extra.has("reasoning_effort"));
+  assert((r2.toJsonText() orelse "?") == withExtra);
+}
+test("decode a request, keep unknown keys, re-encode identically") { test => runDecodeRequest(test); }
+
+// ---------- validation ----------
+
+let runValidate(test: Test): Void {
+  assert(sampleRequest().validate().isEmpty) { lines(sampleRequest().validate()) }
+
+  let hot: ChatRequest = { class: ChatRequest, model: "m", messages: [UserMessage.fromText("hi")], temperature: 2.5 };
+  assert(lines(hot.validate()) == "temperature: must be between 0 and 2, got 2.5") { lines(hot.validate()) }
+
+  let empty = new ChatRequest("", []);
+  assert(lines(empty.validate()) == "model: required | messages: at least one message required") { lines(empty.validate()) }
+
+  let orphanTool = new ChatRequest("m", [UserMessage.fromText("hi"), new ToolMessage("call_9", "{}")]);
+  assert(lines(orphanTool.validate()) == "messages[1].tool_call_id: \"call_9\" does not answer any earlier tool call") { lines(orphanTool.validate()) }
+
+  let badTool: ChatRequest = { class: ChatRequest, model: "m", messages: [UserMessage.fromText("hi")],
+    tools: [new FunctionTool("bad name!"), new FunctionTool("ok"), new FunctionTool("ok")],
+    toolChoice: new NamedToolChoice("nope") };
+  assert(lines(badTool.validate()) == "tools[0].function.name: \"bad name!\" must be 1-64 characters of [A-Za-z0-9_-] | tools[2].function.name: duplicate \"ok\" | tool_choice.function.name: \"nope\" is not one of the tools") { lines(badTool.validate()) }
+
+  let choiceNoTools: ChatRequest = { class: ChatRequest, model: "m", messages: [UserMessage.fromText("hi")], toolChoice: new AutoToolChoice() };
+  assert(lines(choiceNoTools.validate()) == "tool_choice: set but no tools given") { lines(choiceNoTools.validate()) }
+
+  let emptyAssistant = new ChatRequest("m", [UserMessage.fromText("hi"), new AssistantMessage()]);
+  assert(lines(emptyAssistant.validate()) == "messages[1]: assistant message needs content, tool_calls or refusal") { lines(emptyAssistant.validate()) }
+
+  assert(isValidToolName("get_weather-v2"));
+  assert(!isValidToolName(""));
+  assert(!isValidToolName("has space"));
+  assert(!isValidToolName("é"));
+}
+test("validate reports every problem with its path") { test => runValidate(test); }
+
+// ---------- client over a fake transport ----------
+
+class FakeTransport(public status: Int, public body: String) extends Transport {
+  public var last: HttpRequest? = null;
+  public var calls: Int = 0;
+  public send(request: HttpRequest): HttpResponse throws Bubble {
+    last = request;
+    calls += 1;
+    new HttpResponse(status, body)
+  }
+}
+
+class DeadTransport extends Transport {
+  public send(request: HttpRequest): HttpResponse throws Bubble { bubble() }
+}
+
+let runClient(test: Test): Void {
+  let transport = new FakeTransport(200, "{\"id\":\"chatcmpl-123\",\"object\":\"chat.completion\",\"created\":1677652288,\"model\":\"gpt-4o-mini\",\"system_fingerprint\":\"fp_44709d6fcb\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"\\n\\nHello there, how may I assist you today?\"},\"logprobs\":null,\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":12,\"total_tokens\":21}}");
+  let client: ChatClient = { class: ChatClient, transport, apiKey: "sk-test" };
+  let r = client.complete(sampleRequest()) orelse panic();
+  assert(r.text == "\n\nHello there, how may I assist you today?");
+  assert(client.lastError == null) { client.lastError ?? "" }
+  let sent = transport.last;
+  if (sent == null) { assert(false) { "nothing sent" } } else {
+    assert(sent.method == "POST");
+    assert(sent.url == "https://api.openai.com/v1/chat/completions") { sent.url }
+    assert(sent.headers.getOr("Authorization", "") == "Bearer sk-test");
+    assert(sent.headers.getOr("Content-Type", "") == "application/json");
+    assert(sent.body == "{\"model\":\"gpt-4o-mini\",\"messages\":[{\"role\":\"system\",\"content\":\"Be terse.\"},{\"role\":\"user\",\"content\":\"What is the weather in Oslo?\"},{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\":\\\"Oslo\\\"}\"}}]},{\"role\":\"tool\",\"tool_call_id\":\"call_1\",\"content\":\"{\\\"temp_c\\\":7}\"}],\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"description\":\"Current weather\",\"parameters\":{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\"}},\"required\":[\"city\"]}}}],\"tool_choice\":\"auto\",\"temperature\":0.2,\"max_tokens\":256}") { sent.body ?? "<no body>" }
+  }
+
+  // A trailing slash on the base URL is not doubled.
+  let slashed: ChatClient = { class: ChatClient, transport, baseUrl: "http://localhost:11434/v1/" };
+  assert(slashed.completionsUrl == "http://localhost:11434/v1/chat/completions") { slashed.completionsUrl }
+
+  // An invalid request never reaches the transport.
+  let before = transport.calls;
+  client.complete(new ChatRequest("", [])) orelse void;
+  assert(transport.calls == before);
+  assert(client.lastError == "request: model: required") { client.lastError ?? "" }
+  assert(client.lastProblems.length == 2);
+
+  // An HTTP error carries the provider's message.
+  let denied: ChatClient = { class: ChatClient, transport: new FakeTransport(401, "{\"error\":{\"message\":\"Incorrect API key provided\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":\"invalid_api_key\"}}") };
+  denied.complete(sampleRequest()) orelse void;
+  assert(denied.lastError == "http: status 401: Incorrect API key provided (invalid_request_error, invalid_api_key)") { denied.lastError ?? "" }
+
+  // No response at all.
+  let dead: ChatClient = { class: ChatClient, transport: new DeadTransport() };
+  dead.complete(sampleRequest()) orelse void;
+  assert(dead.lastError == "transport: no response from https://api.openai.com/v1/chat/completions") { dead.lastError ?? "" }
+
+  // A 200 with a body that is not a completion.
+  let junk: ChatClient = { class: ChatClient, transport: new FakeTransport(200, "{\"id\":\"x\",\"model\":\"m\"}") };
+  junk.complete(sampleRequest()) orelse void;
+  assert(junk.lastError == "$.choices: expected array, got absent") { junk.lastError ?? "" }
+}
+test("client validates, sends, and explains failures") { test => runClient(test); }

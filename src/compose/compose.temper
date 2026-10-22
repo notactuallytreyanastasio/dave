@@ -1,0 +1,172 @@
+// The composer's assistant: Jam Pilot's `Dave.Compose.assist` on the rounds
+// engine.
+//
+// A teacher types a song as text and asks the bot in plain words; the bot
+// answers with a `Summary:` line and the whole song in a fence. The host's
+// reader checks what comes back, then the host's word list; a song that
+// does not read goes back to the model with the reader's own sentences, up
+// to `rounds` times. The last song that read as a song and was fit for the
+// children is the draft: when the rounds run out it is handed back anyway,
+// problems and all, so the teacher keeps what the bot wrote.
+//
+// The engine (`../rounds`) runs the rounds. This module supplies the setup,
+// the opening turn (the song and the request between markers), the fix
+// turn and every sentence the teacher is shown (`ComposeScript`,
+// `outcome`), and the reading of a reply (`parseReply`, in reply.temper).
+// The system prompt stays the host's: it embeds the host's song format.
+//
+// Effort, measured 2026-10-21 on Fireworks by Jam Pilot: at "medium" and
+// 8,000 tokens the model thought through all 8,000 and never answered;
+// at "low" a 24-bar, three-part song failed the bar count three rounds
+// running, and at "medium" the same request read on the first round. So
+// round 1 is quick and from round 2 on the model is given room to count.
+
+let { JsonString, JsonNull, JsonSyntaxTree } = import("std/json");
+let {
+  Problems, ChatRequest, ChatResponse, Message, SystemMessage, UserMessage, AssistantMessage, ToolMessage,
+  FinishReasons, Choice, Usage,
+} = import("../chat");
+let {
+  RoundsAgent, RoundsPolicy, Script, ReplyReader, Proposal, Candidate, Attempt, Draft, ranOutOfRoom,
+  Step, SendRequest, Check, Done, GaveUp, GiveUpCauses,
+  Event, Start, Responded, TransportFailed, TransportFailures, CheckPassed, CheckRefused,
+} = import("../rounds");
+
+// how many of the reader's sentences go back to the model at once
+let problemsSent = 20;
+
+export class ComposeSetup(
+  // the song as it stands; may be a starting example or empty
+  public song: String,
+  // the teacher's words
+  public request: String,
+  public systemPrompt: String,
+  public model: String,
+  public rounds: Int = 5,
+  public temperature: Float64 = 0.2,
+  public maxTokens: Int = 24000,
+  // sent as `reasoning_effort` on round 1; null leaves it out
+  public effort: String? = "low",
+  // from round 2 on
+  public retryEffort: String? = "medium",
+) {}
+
+export class ComposeAgent(public setup: ComposeSetup) {
+  private engine: RoundsAgent = new RoundsAgent(
+    setup.model,
+    setup.systemPrompt,
+    opening(setup.song, setup.request),
+    composePolicy(setup),
+    new ComposeScript(),
+    new ComposeReader(),
+  );
+
+  public get history(): List<Message> { engine.history }
+  public get attemptsSoFar(): List<Attempt> { engine.attemptsSoFar }
+  public get currentRound(): Int { engine.currentRound }
+  public get draft(): Draft? { engine.draft }
+  public get lastProblems(): List<String> { engine.lastProblems }
+
+  public next(event: Event): Step { engine.next(event) }
+
+  // What the teacher gets from the step that ended the loop.
+  public outcome(step: Step): ComposeOutcome { composeOutcome(step, setup.rounds) }
+}
+
+// A cut-off is not retried: its sentence is the answer. No effort change
+// after one, then.
+let composePolicy(setup: ComposeSetup): RoundsPolicy {
+  new RoundsPolicy(setup.rounds, setup.temperature, setup.maxTokens, setup.effort, setup.retryEffort, null, false, true)
+}
+
+// ---------- what the teacher gets ----------
+
+export sealed interface ComposeOutcome {}
+// A song for the page: `problems` is empty when the reader took it, or the
+// reader's sentences when the rounds ran out and this is the draft.
+export class SongWritten(public text: String, public summary: String, public problems: List<String>) extends ComposeOutcome {}
+// Nothing changed; one sentence for the teacher.
+export class NoSong(public sentence: String) extends ComposeOutcome {}
+
+export let composeOutcome(step: Step, rounds: Int): ComposeOutcome {
+  when (step) {
+    is Done -> new SongWritten(step.candidate.text, step.candidate.summary, []);
+    is GaveUp -> if (step.cause == GiveUpCauses.outOfRounds) {
+      giveUp(rounds, step.problems, step.draft)
+    } else {
+      // a cut-off or a transport failure: its one sentence
+      new NoSong(step.problems.join(" ") { it => it })
+    };
+    // SendRequest and Check do not end the loop
+    else -> panic();
+  }
+}
+
+// Every round failed. A draft that read as a song goes back with its
+// problems, which the page lists under the text; a song refused for its
+// words is said to be unfit, the words themselves stay unsaid.
+let giveUp(rounds: Int, problems: List<String>, draft: Draft?): ComposeOutcome {
+  var unsuitable = false;
+  for (let p of problems) {
+    if (startsWith(p, "The song is for young children")) { unsuitable = true; }
+  }
+  if (unsuitable) {
+    new NoSong("The bot kept writing words that are not suitable for children, so nothing was changed. Try asking for the song another way.")
+  } else if (draft != null) {
+    let n = draft.problems.length;
+    let plural = if (n == 1) { "" } else { "s" };
+    let summary = "${trim(draft.candidate.summary)} After ${rounds} tries the reader still found ${n} thing${plural} to fix, listed under the song: fix them by hand, or ask the bot again.";
+    new SongWritten(draft.candidate.text, summary, draft.problems)
+  } else {
+    new NoSong("The bot's song still did not read after ${rounds} tries. ${problems.join(" ") { it => it }}")
+  }
+}
+
+// ---------- the turns and sentences, as Jam Pilot has them ----------
+
+class ComposeReader extends ReplyReader {
+  public read(reply: String, problems: Problems): Proposal throws Bubble { parseReply(reply, problems) }
+}
+
+class ComposeScript extends Script {
+  // The reader's sentences and the host's go back the same way.
+  public unreadableTurn(problems: List<String>): String { fixTurn(problems) }
+  public refusedTurn(problems: List<String>): String { fixTurn(problems) }
+  public cutOffRecord(reasoningTokens: Int?, maxTokens: Int, beforeAnyAnswer: Boolean): String {
+    ranOutOfRoom(reasoningTokens, maxTokens, beforeAnyAnswer)
+  }
+  // never asked: the policy ends the loop on a cut-off
+  public cutOffTurn(why: String): String { panic() }
+  public transportRecord(why: String, kind: String): String {
+    when (kind) {
+      TransportFailures.noKey -> "The bot is not set up on this server (no GLM_API_KEY).";
+      TransportFailures.sentence -> why;
+      TransportFailures.detail -> "The bot did not answer: ${why}";
+      else -> panic();
+    }
+  }
+}
+
+let opening(song: String, request: String): String {
+  "The song as it stands, between the markers (it may be a starting example\nthe teacher has not touched, or empty):\n\n<<<SONG\n${trim(song)}\nSONG>>>\n\nThe teacher asks, between the markers:\n\n<<<REQUEST\n${trim(request)}\nREQUEST>>>\n"
+}
+
+// At most `problemsSent` of the sentences, then how many more there were.
+export let fixTurn(problems: List<String>): String {
+  let shown = if (problems.length > problemsSent) { problems.slice(0, problemsSent) } else { problems };
+  let rest = problems.length - shown.length;
+  let listed = shown.join("\n") { p => "- ${p}" };
+  let more = if (rest == 0) { "" } else { "\n- ...and ${rest} more like these." };
+  "Jam Pilot could not read that song:\n\n${listed}${more}\n\nA rest inside a bar is r with a length (r, r/2, r/8); - on its own is a\nwhole bar of rest and cannot sit beside notes. The words of a part have one\nsyllable per note, and _ fills a note that has no word.\n\nA bar with too many beats has notes that are too long for it: halve them\n(/1 to /2, /2 to /4, /4 to /8) or move the extra notes into a bar of their\nown, keeping every part the same number of bars. Check every bar of every\npart, not only the ones named, then send the whole corrected song again\nthe same way: a Summary: line and the complete song in a ``` fence.\n"
+}
+
+// String helpers the tests also use. They are library code so every
+// backend's test class can reach them (see the note in repair_test.temper).
+let startsWith(text: String, prefix: String): Boolean {
+  let n = prefix.countBetween(String.begin, prefix.end);
+  text.hasAtLeast(String.begin, text.end, n) && text.slice(String.begin, text.step(String.begin, n)) == prefix
+}
+
+let contains(text: String, needle: String): Boolean {
+  text.indexOf(needle, String.begin) is StringIndex
+}

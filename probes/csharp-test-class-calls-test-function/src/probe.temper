@@ -1,0 +1,14 @@
+// Library code, so the module is not test-only.
+export let double(x: Int): Int { x * 2 }
+
+// A top-level function only tests use: the backends file it with the tests.
+let isEven(x: Int): Boolean { x % 2 == 0 }
+
+// A class only tests use, calling that function.
+class Checker {
+  public check(x: Int): Boolean { isEven(double(x)) }
+}
+
+test("a test-only class calls a test-only function") { test =>
+  assert(new Checker().check(3)) { "6 is even" }
+}

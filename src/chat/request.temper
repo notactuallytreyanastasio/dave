@@ -1,0 +1,192 @@
+// A chat-completions request.
+//
+// Fields are the common subset every OpenAI-compatible provider honours.
+// Anything provider-specific goes in `extra`, which is merged into the
+// top-level object as given, so a host can send `reasoning_effort` or
+// `top_k` without this library knowing about it.
+
+let {
+  InterchangeContext, JsonProducer, JsonSyntaxTree, JsonObject, parseJson,
+} = import("std/json");
+
+@json
+export class ChatRequest(
+  public model: String,
+  public messages: List<Message>,
+  public tools: List<FunctionTool> = [],
+  public toolChoice: ToolChoice? = null,
+  public responseFormat: ResponseFormat? = null,
+  public temperature: Float64? = null,
+  public topP: Float64? = null,
+  public maxTokens: Int? = null,
+  public stop: List<String> = [],
+  public seed: Int? = null,
+  public user: String? = null,
+  public extra: Map<String, JsonSyntaxTree> = new Map<String, JsonSyntaxTree>([]),
+) {
+  public encodeToJson(p: JsonProducer): Void {
+    p.startObject();
+    p.objectKey("model"); p.stringValue(model);
+    p.objectKey("messages");
+    p.startArray();
+    for (let m of messages) { m.encodeToJson(p); }
+    p.endArray();
+    if (!tools.isEmpty) {
+      p.objectKey("tools");
+      p.startArray();
+      for (let t of tools) { t.encodeToJson(p); }
+      p.endArray();
+    }
+    let choice = toolChoice;
+    if (choice != null) { p.objectKey("tool_choice"); choice.encodeToJson(p); }
+    let format = responseFormat;
+    if (format != null) { p.objectKey("response_format"); format.encodeToJson(p); }
+    keyFloatOrSkip(p, "temperature", temperature);
+    keyFloatOrSkip(p, "top_p", topP);
+    keyIntOrSkip(p, "max_tokens", maxTokens);
+    if (!stop.isEmpty) {
+      p.objectKey("stop");
+      p.startArray();
+      for (let s of stop) { p.stringValue(s); }
+      p.endArray();
+    }
+    keyIntOrSkip(p, "seed", seed);
+    keyStringOrSkip(p, "user", user);
+    extra.forEach { k: String, v: JsonSyntaxTree =>
+      p.objectKey(k);
+      v.produce(p);
+    }
+    p.endObject();
+  }
+
+  public toJsonText(): String throws Bubble {
+    jsonText { (p): Void => encodeToJson(p); }
+  }
+
+  // Reads a request back, for proxies and for evals that replay logged
+  // traffic. Unknown top-level keys are kept in `extra`.
+  public static decodeFromJson(t: JsonSyntaxTree, ic: InterchangeContext): ChatRequest throws Bubble {
+    let problems = problemsOf(ic);
+    let o = Obj.at(t, "$", problems);
+    let choiceTree = o.raw("tool_choice");
+    let formatTree = o.raw("response_format");
+    let stops = new ListBuilder<String>();
+    let stopTree = o.raw("stop");
+    if (stopTree != null) {
+      let items = arrayAt(stopTree, o.child("stop"), problems);
+      var i = 0;
+      while (i < items.length) {
+        stops.add(Obj.at(new JsonObject(new Map([new Pair("s", [items[i]])])), "${o.child("stop")}[${i}]", problems).string("s"));
+        i += 1;
+      }
+    }
+    let extra = new MapBuilder<String, JsonSyntaxTree>();
+    o.tree.properties.forEach { k: String, vs: List<JsonSyntaxTree> =>
+      if (!isKnownRequestKey(k) && !vs.isEmpty) { extra[k] = vs[vs.length - 1]; }
+    }
+    new ChatRequest(
+      o.string("model"),
+      decodeMessages(o.list("messages"), o.child("messages"), problems),
+      decodeTools(o.listOrEmpty("tools"), o.child("tools"), problems),
+      if (choiceTree == null) { null } else { decodeToolChoice(choiceTree, o.child("tool_choice"), problems) },
+      if (formatTree == null) { null } else { decodeResponseFormat(formatTree, o.child("response_format"), problems) },
+      o.float64OrNull("temperature"),
+      o.float64OrNull("top_p"),
+      o.intOrNull("max_tokens"),
+      stops.toList(),
+      o.intOrNull("seed"),
+      o.stringOrNull("user"),
+      extra.toMap(),
+    )
+  }
+
+  // What is wrong with this request, as a list of messages; empty means
+  // nothing. Checked before encoding so a bad request never leaves the host.
+  public validate(): List<String> {
+    let out = new ListBuilder<String>();
+    if (model.isEmpty) { out.add("model: required"); }
+    if (messages.isEmpty) { out.add("messages: at least one message required"); }
+    let t = temperature;
+    if (t != null && (t < 0.0 || t > 2.0)) { out.add("temperature: must be between 0 and 2, got ${t}"); }
+    let tp = topP;
+    if (tp != null && (tp < 0.0 || tp > 1.0)) { out.add("top_p: must be between 0 and 1, got ${tp}"); }
+    let mt = maxTokens;
+    if (mt != null && mt < 1) { out.add("max_tokens: must be positive, got ${mt}"); }
+
+    let names = new MapBuilder<String, Boolean>();
+    var ti = 0;
+    for (let tool of tools) {
+      if (!isValidToolName(tool.name)) {
+        out.add("tools[${ti}].function.name: \"${tool.name}\" must be 1-64 characters of [A-Za-z0-9_-]");
+      }
+      if (names.has(tool.name)) { out.add("tools[${ti}].function.name: duplicate \"${tool.name}\""); }
+      names[tool.name] = true;
+      ti += 1;
+    }
+    let choice = toolChoice;
+    if (choice != null) {
+      if (tools.isEmpty) { out.add("tool_choice: set but no tools given"); }
+      // The arms that need an `if` call a helper instead of holding the `if`:
+      // the C# backend emits a lone `if` arm unbraced, even inside `do {}`,
+      // and the `else throw` that closes a sealed `when` then binds to that
+      // inner `if` (dangling else), so the common case throws. A call is one
+      // statement with nothing to dangle. See probes/csharp-dangling-else.
+      when (choice) {
+        is NamedToolChoice -> checkNamedChoice(choice, names, out);
+        else -> void;
+      }
+    }
+
+    // Every tool message answers a tool call from an earlier assistant turn.
+    let pendingCalls = new MapBuilder<String, Boolean>();
+    var mi = 0;
+    for (let m of messages) {
+      when (m) {
+        is AssistantMessage -> do {
+          if (m.content == null && m.toolCalls.isEmpty && m.refusal == null) {
+            out.add("messages[${mi}]: assistant message needs content, tool_calls or refusal");
+          }
+          for (let call of m.toolCalls) { pendingCalls[call.id] = true; }
+        };
+        is ToolMessage -> checkToolMessage(m, mi, pendingCalls, out);
+        is UserMessage -> checkUserMessage(m, mi, out);
+        is SystemMessage -> void;
+      }
+      mi += 1;
+    }
+    out.toList()
+  }
+}
+
+let checkNamedChoice(choice: NamedToolChoice, names: MapBuilder<String, Boolean>, out: ListBuilder<String>): Void {
+  if (!names.has(choice.name)) {
+    out.add("tool_choice.function.name: \"${choice.name}\" is not one of the tools");
+  }
+}
+
+let checkToolMessage(m: ToolMessage, index: Int, pendingCalls: MapBuilder<String, Boolean>, out: ListBuilder<String>): Void {
+  if (!pendingCalls.has(m.toolCallId)) {
+    out.add("messages[${index}].tool_call_id: \"${m.toolCallId}\" does not answer any earlier tool call");
+  }
+}
+
+let checkUserMessage(m: UserMessage, index: Int, out: ListBuilder<String>): Void {
+  if (m.parts.isEmpty) { out.add("messages[${index}].content: empty"); }
+}
+
+let knownRequestKeys: List<String> = [
+  "model", "messages", "tools", "tool_choice", "response_format",
+  "temperature", "top_p", "max_tokens", "stop", "seed", "user",
+];
+
+let isKnownRequestKey(k: String): Boolean {
+  for (let known of knownRequestKeys) {
+    if (known == k) { return true; }
+  }
+  false
+}
+
+export let parseChatRequest(text: String, problems: Problems): ChatRequest throws Bubble {
+  let tree = parseJson(text) orelse do { problems.add("$", "not valid JSON"); bubble() };
+  ChatRequest.decodeFromJson(tree, new DecodeContext(problems))
+}

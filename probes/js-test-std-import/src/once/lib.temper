@@ -1,0 +1,12 @@
+// Library file: imports the std function and uses it.
+let { JsonSyntaxTree, JsonObject, parseJson } = import("std/json");
+
+export let isObject(t: JsonSyntaxTree): Boolean { t is JsonObject }
+
+export let countKeys(text: String): Int throws Bubble {
+  let t = parseJson(text);
+  when (t) {
+    is JsonObject -> t.properties.length;
+    else -> 0;
+  }
+}

@@ -1,0 +1,181 @@
+// A chat-completions response, and the error body providers send instead.
+
+let {
+  InterchangeContext, JsonProducer, JsonSyntaxTree, JsonObject, parseJson,
+} = import("std/json");
+
+export class FinishReasons {
+  public static let stop = "stop";
+  public static let length = "length";
+  public static let toolCalls = "tool_calls";
+  public static let contentFilter = "content_filter";
+}
+
+export class Usage(
+  public promptTokens: Int,
+  public completionTokens: Int,
+  public totalTokens: Int,
+  // completion_tokens_details.reasoning_tokens, where the provider reports it
+  public reasoningTokens: Int? = null,
+) {
+  public encodeToJson(p: JsonProducer): Void {
+    p.startObject();
+    p.objectKey("prompt_tokens"); p.int32Value(promptTokens);
+    p.objectKey("completion_tokens"); p.int32Value(completionTokens);
+    p.objectKey("total_tokens"); p.int32Value(totalTokens);
+    let r = reasoningTokens;
+    if (r != null) {
+      p.objectKey("completion_tokens_details");
+      p.startObject();
+      p.objectKey("reasoning_tokens"); p.int32Value(r);
+      p.endObject();
+    }
+    p.endObject();
+  }
+
+  public static decode(t: JsonSyntaxTree, path: String, problems: Problems): Usage throws Bubble {
+    let o = Obj.at(t, path, problems);
+    // Some providers omit total_tokens; it is the sum when they do.
+    let prompt = o.int("prompt_tokens");
+    let completion = o.int("completion_tokens");
+    let total = o.intOrNull("total_tokens");
+    let details = o.objOrNull("completion_tokens_details");
+    let reasoning = if (details == null) { null } else { details.intOrNull("reasoning_tokens") };
+    new Usage(prompt, completion, if (total == null) { prompt + completion } else { total }, reasoning)
+  }
+}
+
+export class Choice(
+  public index: Int,
+  public message: AssistantMessage,
+  // One of FinishReasons, or whatever the provider sent; null while streaming.
+  public finishReason: String? = null,
+) {
+  public encodeToJson(p: JsonProducer): Void {
+    p.startObject();
+    p.objectKey("index"); p.int32Value(index);
+    p.objectKey("message"); message.encodeToJson(p);
+    p.objectKey("finish_reason");
+    let fr = finishReason;
+    if (fr == null) { p.nullValue(); } else { p.stringValue(fr); }
+    p.endObject();
+  }
+
+  public static decode(t: JsonSyntaxTree, path: String, problems: Problems): Choice throws Bubble {
+    let o = Obj.at(t, path, problems);
+    new Choice(
+      o.int("index"),
+      decodeAssistantMessage(o.obj("message")),
+      o.stringOrNull("finish_reason"),
+    )
+  }
+}
+
+@json
+export class ChatResponse(
+  public id: String,
+  public model: String,
+  public choices: List<Choice>,
+  public created: Int64? = null,
+  public usage: Usage? = null,
+  public systemFingerprint: String? = null,
+) {
+  // The first choice's message, which is the whole answer unless n > 1.
+  public get message(): AssistantMessage throws Bubble { choices[0].message }
+  public get text(): String? { if (choices.isEmpty) { null } else { choices[0].message.content } }
+  public get toolCalls(): List<ToolCall> { if (choices.isEmpty) { [] } else { choices[0].message.toolCalls } }
+  public get finishReason(): String? { if (choices.isEmpty) { null } else { choices[0].finishReason } }
+
+  public encodeToJson(p: JsonProducer): Void {
+    p.startObject();
+    p.objectKey("id"); p.stringValue(id);
+    p.objectKey("object"); p.stringValue("chat.completion");
+    let c = created;
+    if (c != null) { p.objectKey("created"); p.int64Value(c); }
+    p.objectKey("model"); p.stringValue(model);
+    p.objectKey("choices");
+    p.startArray();
+    for (let choice of choices) { choice.encodeToJson(p); }
+    p.endArray();
+    let u = usage;
+    if (u != null) { p.objectKey("usage"); u.encodeToJson(p); }
+    keyStringOrSkip(p, "system_fingerprint", systemFingerprint);
+    p.endObject();
+  }
+
+  public toJsonText(): String throws Bubble {
+    jsonText { (p): Void => encodeToJson(p); }
+  }
+
+  public static decodeFromJson(t: JsonSyntaxTree, ic: InterchangeContext): ChatResponse throws Bubble {
+    let problems = problemsOf(ic);
+    let o = Obj.at(t, "$", problems);
+    let err = o.raw("error");
+    if (err != null) {
+      let e = ApiError.decode(err, o.child("error"), problems);
+      problems.add("$.error", e.describe());
+      bubble()
+    }
+    let choiceTrees = o.list("choices");
+    let choices = new ListBuilder<Choice>();
+    var i = 0;
+    while (i < choiceTrees.length) {
+      choices.add(Choice.decode(choiceTrees[i], "${o.child("choices")}[${i}]", problems));
+      i += 1;
+    }
+    let usageTree = o.raw("usage");
+    new ChatResponse(
+      o.string("id"),
+      o.string("model"),
+      choices.toList(),
+      o.int64OrNull("created"),
+      if (usageTree == null) { null } else { Usage.decode(usageTree, o.child("usage"), problems) },
+      o.stringOrNull("system_fingerprint"),
+    )
+  }
+}
+
+// The body of a non-2xx answer: {"error": {"message": ..., "type": ..., "code": ...}}.
+export class ApiError(
+  public message: String,
+  public kind: String? = null,
+  public code: String? = null,
+  public param: String? = null,
+) {
+  public describe(): String {
+    let k = kind;
+    let c = code;
+    let tags = new ListBuilder<String>();
+    if (k != null) { tags.add(k); }
+    if (c != null) { tags.add(c); }
+    if (tags.isEmpty) { message } else { "${message} (${tags.join(", ") { it => it }})" }
+  }
+
+  public static decode(t: JsonSyntaxTree, path: String, problems: Problems): ApiError throws Bubble {
+    let o = Obj.at(t, path, problems);
+    // `code` is a string in OpenAI's API and a number in some others.
+    let codeTree = o.raw("code");
+    let code: String? = if (codeTree == null) { null } else {
+      o.stringOrNull("code") orelse o.int("code").toString()
+    };
+    new ApiError(o.string("message"), o.stringOrNull("type"), code, o.stringOrNull("param"))
+  }
+}
+
+// Text to response, or problems saying where it went wrong.
+export let parseChatResponse(text: String, problems: Problems): ChatResponse throws Bubble {
+  let tree = parseJson(text) orelse do { problems.add("$", "not valid JSON"); bubble() };
+  ChatResponse.decodeFromJson(tree, new DecodeContext(problems))
+}
+
+// An error body if the text is one, else null. For hosts mapping HTTP
+// failures: a 429 with a JSON error has a message worth surfacing.
+export let parseApiError(text: String): ApiError? {
+  let problems = new Problems();
+  do {
+    let tree = parseJson(text);
+    let o = Obj.at(tree, "$", problems);
+    let err = o.raw("error");
+    if (err == null) { null } else { ApiError.decode(err, "$.error", problems) }
+  } orelse null
+}

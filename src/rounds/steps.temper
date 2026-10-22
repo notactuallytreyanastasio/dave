@@ -1,0 +1,168 @@
+// The vocabulary of a rounds loop: what the host does next, what it reports,
+// and what each round leaves behind.
+//
+// A rounds loop asks a model for something, reads the reply into a
+// candidate, has the host check it, sends the problems back, and stops after
+// N rounds. Jam Pilot runs two of them: the score repair (`../repair`, the
+// reply is find/replace edits to a document) and the composer's assistant
+// (`../compose`, the reply is the whole song). Both hosts match on the
+// classes in this file; the engine that produces them is in agent.temper.
+//
+// A loop may also offer the model tools (`../agent` does: a generic agent
+// with a specialty and the host's tool buckets). A reply that calls them
+// is a `RunTools` step inside the round, answered with `ToolsRan`; the
+// round goes on until the model answers in text.
+
+let { JsonProducer, JsonTextProducer } = import("std/json");
+let { ChatRequest, ChatResponse, FunctionTool, ToolCall } = import("../chat");
+
+// ---------- what a reply proposes ----------
+
+// One find/replace edit, the record of a proposal that patches a document
+// rather than replacing it. A loop whose reply is the text itself records
+// none. `find` is copied verbatim from the document; without `occurrence`
+// it must occur exactly once; `occurrence` is 1-based, or `all` is every
+// occurrence. The JSON shape is the one the model is asked for.
+export class Edit(
+  public find: String,
+  public replace: String,
+  // null: must be unique; n: the n-th occurrence, 1-based
+  public occurrence: Int? = null,
+  // "all": every occurrence
+  public all: Boolean = false,
+) {
+  public encodeToJson(p: JsonProducer): Void {
+    p.startObject();
+    p.objectKey("find"); p.stringValue(find);
+    p.objectKey("replace"); p.stringValue(replace);
+    p.objectKey("occurrence");
+    let n = occurrence;
+    if (all) { p.stringValue("all"); } else if (n == null) { p.nullValue(); } else { p.int32Value(n); }
+    p.endObject();
+  }
+}
+
+export let editsJson(edits: List<Edit>): String {
+  let p = new JsonTextProducer();
+  p.startArray();
+  for (let e of edits) { e.encodeToJson(p); }
+  p.endArray();
+  p.toJsonString() orelse "[]"
+}
+
+// What the reader read in a reply: its summary for the person, and either
+// the text itself or the edits that make it. The reader's `realize` turns
+// it into the text the host checks.
+export class Proposal(
+  public summary: String,
+  public edits: List<Edit> = [],
+  public text: String? = null,
+) {}
+
+// A proposal realised: the text the host checks, with what was said about
+// it and what it was made with.
+export class Candidate(
+  public text: String,
+  public summary: String,
+  public edits: List<Edit> = [],
+) {}
+
+// The candidate the host refused but said to keep, with the problems it
+// was refused for. Handed back in GaveUp when the policy keeps drafts, so
+// the person keeps what the model wrote and can fix it by hand.
+export class Draft(public candidate: Candidate, public problems: List<String>) {}
+
+// One round, as the record keeps it.
+export class Attempt(
+  public round: Int,
+  public summary: String?,
+  public edits: List<Edit>,
+  public error: String?,
+  // which teacher retry this attempt belonged to; null for the first run
+  public retry: Int? = null,
+  // how many tool calls the model made in this round
+  public toolCalls: Int = 0,
+) {}
+
+// ---------- tools ----------
+
+// A named set of tools the host can run. The host's catalogue is a list of
+// these; a specialty names the buckets it may use, and only those are
+// offered to the model. A call the model makes comes back to the host in a
+// `ToolRun` with its bucket's name, so the host dispatches by bucket
+// without a lookup of its own.
+export class ToolBucket(
+  public name: String,
+  public tools: List<FunctionTool>,
+) {
+  public has(toolName: String): Boolean {
+    for (var i = 0; i < tools.length; i += 1) {
+      if (tools[i].name == toolName) { return true; }
+    }
+    false
+  }
+}
+
+// One call to run, and the bucket its tool is in.
+export class ToolRun(public call: ToolCall, public bucket: String) {}
+
+// What a tool said, as the text the model reads back. A tool that failed
+// says so in `content`: the model should hear it and try something else.
+export class ToolResult(public callId: String, public content: String) {}
+
+// ---------- what the host does next ----------
+
+export sealed interface Step {}
+// Post this to the model and report Responded or TransportFailed.
+export class SendRequest(public request: ChatRequest) extends Step {}
+// Run the reader on the candidate's text and report CheckPassed or CheckRefused.
+export class Check(public candidate: Candidate) extends Step {}
+// Run every tool and report ToolsRan with one result per run. A call that
+// named no tool in any offered bucket is not here: the engine answered it.
+export class RunTools(public runs: List<ToolRun>) extends Step {}
+// The host's check passed: the loop is over, every round recorded.
+export class Done(public candidate: Candidate, public attempts: List<Attempt>) extends Step {}
+// The loop is over without a candidate that passed. `problems` are the last
+// refusal's (or the one sentence of the cut-off or transport failure that
+// ended it); `cause` is one of GiveUpCauses.
+export class GaveUp(
+  public attempts: List<Attempt>,
+  public draft: Draft?,
+  public problems: List<String>,
+  public cause: String,
+) extends Step {}
+
+export class GiveUpCauses {
+  // every round was used
+  public static let outOfRounds = "out of rounds";
+  // the reply was cut off at max_tokens and the policy does not retry one
+  public static let cutOff = "cut off";
+  // no reply at all, or a reply with no choices
+  public static let transportFailed = "transport failed";
+}
+
+// ---------- what the host reports ----------
+
+export sealed interface Event {}
+export class Start extends Event {}
+export class Responded(public response: ChatResponse) extends Event {}
+// No reply at all. `kind` says what `why` is, one of TransportFailures, so
+// the loop's script can word it for the person.
+export class TransportFailed(public why: String, public kind: String = TransportFailures.sentence) extends Event {}
+
+export class TransportFailures {
+  // the host has no API key; `why` is whatever the host says, the script has the sentence
+  public static let noKey = "no key";
+  // `why` is already a sentence for the person
+  public static let sentence = "sentence";
+  // `why` is a raw detail (an inspected term, an exception); the script wraps it
+  public static let detail = "detail";
+}
+
+export class CheckPassed extends Event {}
+// The results of the last RunTools, one per run, in any order.
+export class ToolsRan(public results: List<ToolResult>) extends Event {}
+// The host's check refused the candidate with these sentences. `keep`: the
+// candidate may still be handed back as the draft if nothing better comes
+// (false for one the person must never see, whatever its problems).
+export class CheckRefused(public problems: List<String>, public keep: Boolean = true) extends Event {}

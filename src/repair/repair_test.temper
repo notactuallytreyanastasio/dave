@@ -1,0 +1,350 @@
+// Tests for the repair module, ported from notedance_viewer's
+// test/dave/hotfix_test.exs. The scripted model there is a GenServer that
+// pops canned replies; here it is a list the test walks while it drives
+// the step machine, and the "reader" is a function of the test that
+// refuses any document still holding a 32nd or a half note.
+//
+// No std import here: the module's library files already bind what the
+// tests use (see probes/js-test-std-import).
+
+// A score with one note written as a 32nd (value 3), which the reader
+// refuses by name. The fix is the value back to a 16th.
+let broken = "<score><bar><value>6</value><value>3</value></bar><bar><value>6</value></bar></score>";
+let fixReply = "{\"summary\": \"A 32nd note in bar 1 was written as a sixteenth.\", \"edits\": [{\"find\": \"<value>3</value>\", \"replace\": \"<value>4</value>\"}]}";
+let systemPrompt = "You repair scores. defmodule Dave.NFM.Parser ... Reply with JSON only";
+
+// `contains` and `endsWith` live in edits.temper, not here: the C# backend
+// emits a test-only class in its own file and calls a test-only top-level
+// function from it by an unqualified name that does not resolve there.
+
+// A scripted reply: a completion text, or a cut-off, or a transport failure.
+sealed interface Scripted {}
+class Says(public text: String) extends Scripted {}
+class CutOff(public reasoningTokens: Int) extends Scripted {}
+class Dead(public why: String) extends Scripted {}
+// a 200 whose choices array is empty
+class NoChoices extends Scripted {}
+
+// Drive the agent to its end. Every request the model would have seen is
+// kept in `requests`, in order, so a test can check what it saw.
+class Run(public setup: RepairSetup, public script: List<Scripted>) {
+  public agent: RepairAgent = new RepairAgent(setup);
+  public requests: ListBuilder<ChatRequest> = new ListBuilder<ChatRequest>();
+  public var checks: Int = 0;
+  public var fixed: String? = null;
+  public var summary: String? = null;
+  public var attempts: List<Attempt> = [];
+  public var gaveUp: Boolean = false;
+
+  // These two are methods, not top-level functions, because the C# backend
+  // emits a test-only class in its own file and calls a test-only top-level
+  // function from it by an unqualified name that does not resolve there.
+
+  // The strict reader: a refusal sentence, or null when the document reads.
+  // `has` rather than the module's `contains`: a test-only class in C#
+  // comes out without the `using static` that resolves module functions.
+  private has(document: String, needle: String): Boolean {
+    document.indexOf(needle, String.begin) is StringIndex
+  }
+
+  public reader(document: String): String? {
+    if (has(document, "<value>3</value>")) {
+      "TODO: NFMXML note value 3.0 not yet observed"
+    } else if (has(document, "<value>2</value>")) {
+      "TODO: NFMXML note value 2.0 not yet observed"
+    } else {
+      null
+    }
+  }
+
+  public completion(text: String?, finish: String, reasoning: Int?): ChatResponse {
+    new ChatResponse("r", "m", [new Choice(0, new AssistantMessage(text), finish)], null,
+      new Usage(10, 20, 30, reasoning))
+  }
+
+  public go(): Void {
+    var step = agent.next(new Start());
+    var replies = 0;
+    var running = true;
+    while (running) {
+      // `step` is a var; only a `let` narrows in a `when`.
+      let current = step;
+      when (current) {
+        is SendRequest -> do {
+          requests.add(current.request);
+          if (replies >= script.length) {
+            step = agent.next(new TransportFailed("scripted model ran out of replies"));
+          } else {
+            let next = script[replies];
+            replies += 1;
+            step = when (next) {
+              is Says -> agent.next(new Responded(completion(next.text, FinishReasons.stop, 100)));
+              is CutOff -> agent.next(new Responded(completion(null, FinishReasons.length, next.reasoningTokens)));
+              is Dead -> agent.next(new TransportFailed(next.why));
+              is NoChoices -> agent.next(new Responded(new ChatResponse("r", "m", [], null, null)));
+            };
+          }
+        };
+        is Check -> do {
+          checks += 1;
+          let refusal = reader(current.candidate.text);
+          step = if (refusal == null) { agent.next(new CheckPassed()) } else { agent.next(new CheckRefused([refusal])) };
+        };
+        is Done -> do {
+          fixed = current.candidate.text;
+          summary = current.candidate.summary;
+          attempts = current.attempts;
+          running = false;
+        };
+        is GaveUp -> do {
+          attempts = current.attempts;
+          gaveUp = true;
+          running = false;
+        };
+      }
+    }
+  }
+}
+
+let setupWith(script: List<Scripted>, guidance: Guidance?): Run {
+  let setup: RepairSetup = { class: RepairSetup, document: broken, refusal: "TODO: NFMXML note value 3.0",
+    systemPrompt: systemPrompt, model: "glm-5.3", guidance: guidance };
+  new Run(setup, script)
+}
+
+let roles(request: ChatRequest): String {
+  request.messages.map { (m): String => m.role }.join(" ") { it => it }
+}
+
+let userText(m: Message): String {
+  when (m) {
+    is UserMessage -> m.text ?? "";
+    is SystemMessage -> m.content;
+    is AssistantMessage -> m.content ?? "";
+    is ToolMessage -> m.content;
+  }
+}
+
+let lastUserText(request: ChatRequest): String {
+  userText(request.messages[request.messages.length - 1])
+}
+
+let extraEffort(request: ChatRequest): String {
+  let v = request.extra.getOr("reasoning_effort", new JsonNull());
+  when (v) {
+    is JsonString -> v.content;
+    else -> "(none)";
+  }
+}
+
+// ---------- Edits.parse ----------
+
+let runParse(test: Test): Void {
+  let problems = new Problems();
+  let plain = parseEdits("{\"summary\": \"s\", \"edits\": [{\"find\": \"a\", \"replace\": \"b\"}]}", problems) orelse panic();
+  assert(plain.summary == "s");
+  assert(plain.edits.length == 1 && plain.edits[0].find == "a" && plain.edits[0].replace == "b" && plain.edits[0].occurrence == null && !plain.edits[0].all);
+
+  let fenced = parseEdits("```json\n{\"summary\": \"s\", \"edits\": [{\"find\": \"a\", \"replace\": \"b\", \"occurrence\": 2}]}\n```", problems) orelse panic();
+  assert(fenced.edits[0].occurrence == 2);
+
+  let prose = parseEdits("Here you go: {\"summary\": \"s\", \"edits\": [{\"find\": \"a\", \"replace\": \"\", \"occurrence\": \"all\"}]}", problems) orelse panic();
+  assert(prose.edits[0].all);
+  assert(problems.isEmpty) { problems.summary() }
+
+  // the sentences go back to the model as its next turn: no "reply: " path
+  expectParseProblem(test, "sorry, no", "reply is not JSON");
+  expectParseProblem(test, "{\"ok\": true}", "reply is not {\"summary\": ..., \"edits\": [...]}");
+  expectParseProblem(test, "{\"edits\": [{\"find\": \"\"}]}", "edit 1 needs a non-empty \"find\" and a \"replace\" string");
+  let badOccurrence = "edit 1: occurrence must be a positive integer or \"all\"";
+  expectParseProblem(test, "{\"edits\": [{\"find\": \"a\", \"replace\": \"b\", \"occurrence\": 0}]}", badOccurrence);
+  // a number that is not an integer literal, or a string that is not all
+  // digits, is refused rather than truncated (2.5 -> 2 would place the
+  // edit at the wrong occurrence)
+  expectParseProblem(test, "{\"edits\": [{\"find\": \"a\", \"replace\": \"b\", \"occurrence\": 2.5}]}", badOccurrence);
+  expectParseProblem(test, "{\"edits\": [{\"find\": \"a\", \"replace\": \"b\", \"occurrence\": 2.0}]}", badOccurrence);
+  expectParseProblem(test, "{\"edits\": [{\"find\": \"a\", \"replace\": \"b\", \"occurrence\": 1e2}]}", badOccurrence);
+  expectParseProblem(test, "{\"edits\": [{\"find\": \"a\", \"replace\": \"b\", \"occurrence\": \" 2\"}]}", badOccurrence);
+  expectParseProblem(test, "{\"edits\": [{\"find\": \"a\", \"replace\": \"b\", \"occurrence\": \"\"}]}", badOccurrence);
+  let digits = parseEdits("{\"edits\": [{\"find\": \"a\", \"replace\": \"b\", \"occurrence\": \"12\"}]}", new Problems()) orelse panic();
+  assert(digits.edits[0].occurrence == 12);
+}
+test("plain JSON, fenced JSON, prose before the object all read; a reply off the contract says why") { test => runParse(test); }
+
+let expectParseProblem(test: Test, reply: String, want: String): Void {
+  let problems = new Problems();
+  parseEdits(reply, problems) orelse new EditBatch("", []);
+  let got = problems.last ?? "<no problem>";
+  assert(got == want) { "want `${want}` got `${got}`" }
+}
+
+// ---------- Edits.apply ----------
+
+let apply(text: String, edits: List<Edit>): String {
+  let problems = new Problems();
+  applyEdits(text, edits, problems) orelse "ERROR ${problems.last ?? ""}"
+}
+
+let runApply(test: Test): Void {
+  assert(apply("x a x", [new Edit("a", "b")]) == "x b x");
+  let twice = apply("x a a", [new Edit("a", "b")]);
+  assert(twice == "ERROR edit 1 (find \"a\"): occurs 2 times; add \"occurrence\" (1-based) or \"all\", or widen find to make it unique") { twice }
+  assert(apply("x a a", [new Edit("a", "b", 2)]) == "x a b");
+  assert(apply("a a a", [new Edit("a", "b", null, true)]) == "b b b");
+  let missing = apply("x", [new Edit("q", "b")]);
+  assert(missing == "ERROR edit 1 (find \"q\"): not found in the document; copy the text exactly as it is") { missing }
+  let third = apply("a", [new Edit("a", "b", 3)]);
+  assert(third == "ERROR edit 1 (find \"a\"): occurrence 3 asked but it occurs only 1 times") { third }
+  // in order, each on the previous result
+  assert(apply("a", [new Edit("a", "b"), new Edit("b", "c")]) == "c");
+  // a long find is cut in the message
+  let long = apply("x", [new Edit("abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghij", "b")]);
+  // cut at 80 characters with no suffix, as Jam Pilot cut it
+  // (inspect(String.slice(find, 0, 80)))
+  assert(contains(long, "ghijklmnopqrstuvwxyzab\"): not found")) { long }
+  assert(!contains(long, "abcdefghij\")")) { long }
+  assert(!contains(long, "...")) { long }
+  let exact = apply("x", [new Edit("abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzab", "b")]);
+  assert(contains(exact, "(find \"abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzab\"): not found")) { exact }
+  // the find is quoted the way inspect/1 prints a string: quotes,
+  // backslashes, newlines, tabs, returns and #{ escaped
+  let escaped = apply("x", [new Edit("a\"b\\c\nd\te\rf#{g", "b")]);
+  assert(escaped == "ERROR edit 1 (find \"a\\\"b\\\\c\\nd\\te\\rf\\#{g\"): not found in the document; copy the text exactly as it is") { escaped }
+}
+test("a unique find replaces; a repeated one needs an occurrence; all replaces every one; edits apply in order") { test => runApply(test); }
+
+// ---------- the loop ----------
+
+let runGoodFirstReply(test: Test): Void {
+  let run = setupWith([new Says(fixReply)], null);
+  assert(run.reader(broken) != null) { "the broken fixture must be refused" }
+  run.go();
+  assert(!run.gaveUp);
+  assert(run.fixed == "<score><bar><value>6</value><value>4</value></bar><bar><value>6</value></bar></score>") { run.fixed ?? "" }
+  assert(run.summary == "A 32nd note in bar 1 was written as a sixteenth.");
+  assert(run.attempts.length == 1 && run.attempts[0].error == null && run.attempts[0].round == 1);
+  assert(run.checks == 1);
+  // the model saw the system prompt and the refusal, and the document
+  let first = run.requests[0];
+  assert(roles(first) == "system user") { roles(first) }
+  assert(userText(first.messages[0]) == systemPrompt);
+  let turn = lastUserText(first);
+  assert(contains(turn, "TODO: NFMXML note value 3.0"));
+  assert(contains(turn, "<score>"));
+  assert(endsWith(turn, "${broken}\n")) { turn }
+  assert(!contains(turn, "TEACHER NOTE"));
+  assert(first.model == "glm-5.3" && first.temperature == 0.2 && first.maxTokens == 16000);
+  assert(extraEffort(first) == "high");
+}
+test("a good first reply fixes the document; the model saw the prompt, the refusal and the document") { test => runGoodFirstReply(test); }
+
+let runThreeRounds(test: Test): Void {
+  let run = setupWith([
+    new Says("{\"summary\": \"nope\", \"edits\": [{\"find\": \"<value>99</value>\", \"replace\": \"<value>4</value>\"}]}"),
+    new Says("{\"summary\": \"still\", \"edits\": [{\"find\": \"<value>3</value>\", \"replace\": \"<value>2</value>\"}]}"),
+    new Says(fixReply),
+  ], null);
+  run.go();
+  assert(!run.gaveUp);
+  assert(run.attempts.length == 3) { "attempts ${run.attempts.length}" }
+  let e1 = run.attempts[0].error ?? "";
+  let e2 = run.attempts[1].error ?? "";
+  assert(run.attempts[0].round == 1 && run.attempts[1].round == 2 && run.attempts[2].round == 3);
+  assert(contains(e1, "not found")) { e1 }
+  assert(run.attempts[0].summary == "nope");
+  assert(contains(e2, "the reader still refuses")) { e2 }
+  assert(contains(e2, "note value 2")) { e2 }
+  assert(run.attempts[2].error == null);
+  assert(run.checks == 2);
+  // round three's conversation carries both failed replies and both complaints
+  assert(run.requests.length == 3);
+  let third = run.requests[2];
+  assert(roles(third) == "system user assistant user assistant user") { roles(third) }
+  assert(contains(lastUserText(third), "That did not work"));
+  assert(contains(lastUserText(third), "apply to the ORIGINAL document"));
+}
+test("an edit that does not place, then one the reader still refuses, then a good one: three rounds, each recorded") { test => runThreeRounds(test); }
+
+let runOutOfRounds(test: Test): Void {
+  let bad = new Says("{\"summary\": \"x\", \"edits\": [{\"find\": \"<value>99</value>\", \"replace\": \"y\"}]}");
+  let run = setupWith([bad, bad, bad], null);
+  run.go();
+  assert(run.gaveUp);
+  assert(run.attempts.length == 3);
+  assert(run.requests.length == 3);
+}
+test("out of rounds is a GaveUp with every attempt") { test => runOutOfRounds(test); }
+
+let runNoReply(test: Test): Void {
+  let run = setupWith([new Dead("no GLM_API_KEY configured")], null);
+  run.go();
+  assert(run.gaveUp);
+  assert(run.attempts.length == 1);
+  assert(run.attempts[0].error == "no GLM_API_KEY configured");
+}
+test("no reply at all: one failed attempt that says so") { test => runNoReply(test); }
+
+let runNoChoices(test: Test): Void {
+  let run = setupWith([new NoChoices(), new Says(fixReply)], null);
+  run.go();
+  assert(run.gaveUp);
+  assert(run.attempts.length == 1) { "attempts ${run.attempts.length}" }
+  assert(run.attempts[0].error == "the model answered with no choices") { run.attempts[0].error ?? "" }
+  // no cut-off turn, no second request
+  assert(run.requests.length == 1) { "requests ${run.requests.length}" }
+}
+test("a 200 with no choices is one failed attempt, not a cut-off to retry") { test => runNoChoices(test); }
+
+let runCutOff(test: Test): Void {
+  let run = setupWith([new CutOff(15673), new Says(fixReply)], null);
+  run.go();
+  assert(!run.gaveUp);
+  assert(run.attempts.length == 2);
+  let first = run.attempts[0].error ?? "";
+  assert(contains(first, "ran out of room")) { first }
+  assert(contains(first, "15673 of 16000")) { first }
+  assert(contains(first, "before any answer")) { first }
+  assert(run.attempts[1].error == null);
+  // the second request asks briefly, at low effort
+  assert(extraEffort(run.requests[0]) == "high");
+  assert(extraEffort(run.requests[1]) == "low") { extraEffort(run.requests[1]) }
+  let turn = lastUserText(run.requests[1]);
+  assert(contains(turn, "Do not deliberate")) { turn }
+  assert(contains(turn, "15673 of 16000")) { turn }
+  assert(roles(run.requests[1]) == "system user user") { roles(run.requests[1]) }
+}
+test("a reply cut off at max_tokens is asked for again, briefly, at low effort") { test => runCutOff(test); }
+
+let runGuidance(test: Test): Void {
+  let guidance = new Guidance("keep the second voice", 3, [new Attempt(1, "dropped it", [], null)]);
+  let run = setupWith([new Says(fixReply)], guidance);
+  run.go();
+  assert(!run.gaveUp);
+  let first = run.requests[0];
+  let system = userText(first.messages[0]);
+  let user = lastUserText(first);
+  assert(contains(user, "<<<TEACHER NOTE (about bar 3)>>>\nkeep the second voice\n<<<END TEACHER NOTE>>>")) { user }
+  assert(contains(user, "The earlier attempts were:"));
+  assert(contains(user, "If the earlier patch already agrees with her note"));
+  assert(contains(user, "- round 1: dropped it; edits: []")) { user }
+  assert(!contains(user, "of retry")) { user }
+}
+test("guidance goes into the first user turn, not the system prompt") { test => runGuidance(test); }
+
+// Jam Pilot's guidance_block prints "- round N of retry R:" when the attempt
+// map carries "retry"; an attempt without it prints just the round.
+let runGuidanceRetry(test: Test): Void {
+  let guidance = new Guidance("keep the second voice", null, [
+    new Attempt(1, "dropped it", [], null, 1),
+    new Attempt(2, "kept it", [], "the reader still refuses"),
+  ]);
+  let run = setupWith([new Says(fixReply)], guidance);
+  run.go();
+  assert(!run.gaveUp);
+  let user = lastUserText(run.requests[0]);
+  assert(contains(user, "- round 1 of retry 1: dropped it; edits: []\n")) { user }
+  assert(contains(user, "\n- round 2: kept it; edits: []; the reader then said: the reader still refuses")) { user }
+  assert(!contains(user, "round 2 of retry")) { user }
+  assert(contains(user, "<<<TEACHER NOTE>>>\nkeep the second voice")) { user }
+}
+test("an attempt with retry prints \"of retry R\" after the round; one without does not") { test => runGuidanceRetry(test); }

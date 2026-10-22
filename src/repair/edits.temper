@@ -1,0 +1,327 @@
+// A model's reply as find/replace edits, and applying them to a document.
+//
+// Ported from Jam Pilot's `Dave.Hotfix.Edits` (notedance_viewer,
+// lib/dave/hotfix/edits.ex), where GLM 5.3 patches a Noteflight score
+// until a strict reader accepts it. The contract and every error
+// sentence are kept, because the sentences go back to the model as the
+// next turn and were tuned against it.
+//
+// The reply is JSON, possibly inside a ```json fence or after prose:
+//
+//     {"summary": "one or two sentences for the reviewer",
+//      "edits": [{"find": "...", "replace": "...", "occurrence": 2}, ...]}
+//
+// `find` is copied verbatim from the document. Without `occurrence` it
+// must occur exactly once (bars of a score are often byte-identical, so a
+// bare replace of bar 5 would hit bar 2). `occurrence` is 1-based, or
+// "all". Edits apply in order, each to the result of the one before. Any
+// edit that cannot be placed stops the whole batch with a sentence.
+//
+// The sentences carry no path prefix (Problems.note, not add): the model
+// gets `problems.last` as its next turn, and "reply: reply is not JSON"
+// is not the turn it was tuned against. Where the port cannot say what
+// Jam Pilot said, measured with the parity probe against HEAD's
+// Dave.Hotfix.Edits:
+//   - "reply is not JSON" has no position detail. Jason appended
+//     "unexpected byte at position 59: 0x61 ("a")"; Temper's parseJson
+//     reports nothing.
+//   - "reply is not {"summary": ..., "edits": [...]}" has no
+//     `: #{inspect(other, limit: 10)}` tail.
+//   - an occurrence beyond 32 bits (99999999999) is refused as "must be
+//     a positive integer"; Jam Pilot accepted it and failed at apply
+//     with "occurrence 99999999999 asked but it occurs only k times".
+//     A string occurrence must be all digits: Integer.parse also took "+2".
+//   - the find in "edit N (find "..."): ..." is cut at 80 code points,
+//     not 80 graphemes, and escapes only \, ", newline, tab, carriage
+//     return and #{; `inspect` prints a find holding other control
+//     characters as a <<...>> binary.
+
+let {
+  JsonSyntaxTree, JsonObject, JsonArray, JsonString, JsonNumeric, JsonNull, parseJson,
+} = import("std/json");
+let { Problems } = import("../chat");
+// Edit (the data class and its JSON) lives with the engine, which records
+// edits in every Attempt; reading and applying them is this loop's business.
+let { Edit, editsJson } = import("../rounds");
+
+// What a reply parsed to: the summary for the reviewer and the edits.
+export class EditBatch(public summary: String, public edits: List<Edit>) {}
+
+// Parse the model's reply. On failure the reason is on `problems` and its
+// last message is the sentence to send back.
+export let parseEdits(reply: String, problems: Problems): EditBatch throws Bubble {
+  let json = unfence(reply);
+  let tree = decodeLenient(json) orelse do {
+    problems.note("reply is not JSON");
+    bubble()
+  };
+  let o: JsonObject = when (tree) {
+    is JsonObject -> tree;
+    else -> do { problems.note(notTheContract); bubble() }
+  };
+  let editsTree = o.propertyValueOrNull("edits");
+  let edits: List<JsonSyntaxTree> = when (editsTree) {
+    is JsonArray -> editsTree.elements;
+    else -> do { problems.note(notTheContract); bubble() }
+  };
+  let summaryTree = o.propertyValueOrNull("summary");
+  let summary: String = when (summaryTree) {
+    is JsonString -> summaryTree.content;
+    else -> "";
+  };
+  let out = new ListBuilder<Edit>();
+  var i = 0;
+  while (i < edits.length) {
+    out.add(normalizeEdit(edits[i], i + 1, problems));
+    i += 1;
+  }
+  new EditBatch(summary, out.toList())
+}
+
+let notTheContract = "reply is not {\"summary\": ..., \"edits\": [...]}";
+
+let normalizeEdit(t: JsonSyntaxTree, n: Int, problems: Problems): Edit throws Bubble {
+  let needs = "edit ${n} needs a non-empty \"find\" and a \"replace\" string";
+  let badOccurrence = "edit ${n}: occurrence must be a positive integer or \"all\"";
+  let o: JsonObject = when (t) {
+    is JsonObject -> t;
+    else -> do { problems.note(needs); bubble() }
+  };
+  let findTree = o.propertyValueOrNull("find");
+  let replaceTree = o.propertyValueOrNull("replace");
+  let find: String = when (findTree) {
+    is JsonString -> findTree.content;
+    else -> "";
+  };
+  let replace: String = when (replaceTree) {
+    is JsonString -> replaceTree.content;
+    else -> do { problems.note(needs); bubble() }
+  };
+  if (find.isEmpty) { problems.note(needs); bubble(); }
+  let occ = o.propertyValueOrNull("occurrence");
+  when (occ) {
+    is JsonNumeric -> do {
+      // JsonNumeric.asInt32 falls back to toFloat64().toInt32(), so 2.5,
+      // 2.0 and 1e2 would come out as 2, 2 and 100 and the edit would land
+      // at a truncated position. Jason gave Jam Pilot a float for those,
+      // which is_integer refused; refuse the same tokens.
+      let token = occ.asJsonNumericToken();
+      if (contains(token, ".") || contains(token, "e") || contains(token, "E")) {
+        problems.note(badOccurrence);
+        bubble();
+      }
+      let k = occ.asInt32() orelse -1;
+      if (k < 1) { problems.note(badOccurrence); bubble(); }
+      new Edit(find, replace, k, false)
+    };
+    is JsonString -> do {
+      if (occ.content == "all") {
+        new Edit(find, replace, null, true)
+      } else {
+        // String.toInt32 takes " 2"; Integer.parse(s) == {n, ""} did not.
+        if (!allDigits(occ.content)) { problems.note(badOccurrence); bubble(); }
+        let k = occ.content.toInt32(10) orelse -1;
+        if (k < 1) { problems.note(badOccurrence); bubble(); }
+        new Edit(find, replace, k, false)
+      }
+    };
+    is JsonNull -> new Edit(find, replace, null, false);
+    else -> if (occ == null) {
+      new Edit(find, replace, null, false)
+    } else {
+      do { problems.note(badOccurrence); bubble() }
+    };
+  }
+}
+
+// One or more ASCII digits and nothing else.
+let allDigits(s: String): Boolean {
+  if (s.isEmpty) { return false; }
+  var i = String.begin;
+  while (s.hasIndex(i)) {
+    let c = s[i];
+    if (c < char'0' || c > char'9') { return false; }
+    i = s.next(i);
+  }
+  true
+}
+
+// ```json ... ``` around the object is dropped; otherwise the reply is
+// taken as it stands.
+let unfence(reply: String): String {
+  let fenceOpen = reply.indexOf("```", String.begin);
+  when (fenceOpen) {
+    is StringIndex -> do {
+      let afterOpen = reply.indexOf("{", fenceOpen);
+      when (afterOpen) {
+        is StringIndex -> do {
+          let close = reply.indexOf("```", afterOpen);
+          when (close) {
+            is StringIndex -> do {
+              // The object ends at the last "}" before the closing fence.
+              let end = lastIndexOfBefore(reply, "}", close);
+              when (end) {
+                is StringIndex -> reply.slice(afterOpen, reply.next(end));
+                else -> reply;
+              }
+            };
+            else -> reply;
+          }
+        };
+        else -> reply;
+      }
+    };
+    else -> reply;
+  }
+}
+
+// JSON as given, or from the first "{" when prose precedes the object.
+let decodeLenient(text: String): JsonSyntaxTree throws Bubble {
+  parseJson(text) orelse do {
+    let brace = text.indexOf("{", String.begin);
+    when (brace) {
+      is StringIndex -> parseJson(text.slice(brace, text.end));
+      else -> bubble();
+    }
+  }
+}
+
+// ---------- applying ----------
+
+// Apply the edits in order; the first one that cannot be placed stops
+// everything, with "edit N (find "..."): why" on `problems`.
+export let applyEdits(document: String, edits: List<Edit>, problems: Problems): String throws Bubble {
+  var text = document;
+  var i = 0;
+  while (i < edits.length) {
+    let edit = edits[i];
+    text = applyOne(text, edit, "edit ${i + 1} (find \"${quoted(edit.find, 80)}\")", problems);
+    i += 1;
+  }
+  text
+}
+
+let applyOne(text: String, edit: Edit, where: String, problems: Problems): String throws Bubble {
+  let positions = findAll(text, edit.find);
+  let k = positions.length;
+  if (k == 0) {
+    problems.add(where, "not found in the document; copy the text exactly as it is");
+    bubble()
+  } else if (edit.all) {
+    replaceAt(text, edit.find, edit.replace, positions)
+  } else {
+    let n = edit.occurrence;
+    if (n == null) {
+      if (k == 1) {
+        replaceAt(text, edit.find, edit.replace, positions)
+      } else {
+        problems.add(where, "occurs ${k} times; add \"occurrence\" (1-based) or \"all\", or widen find to make it unique");
+        bubble()
+      }
+    } else if (n > k) {
+      problems.add(where, "occurrence ${n} asked but it occurs only ${k} times");
+      bubble()
+    } else {
+      replaceAt(text, edit.find, edit.replace, [positions[n - 1]])
+    }
+  }
+}
+
+// Non-overlapping occurrences, left to right, as `:binary.matches` finds them.
+let findAll(text: String, needle: String): List<StringIndex> {
+  let out = new ListBuilder<StringIndex>();
+  let needleLength = needle.countBetween(String.begin, needle.end);
+  var from = String.begin;
+  var searching = true;
+  while (searching) {
+    let found = text.indexOf(needle, from);
+    when (found) {
+      is StringIndex -> do {
+        out.add(found);
+        from = text.step(found, needleLength);
+      };
+      else -> do { searching = false; };
+    }
+  }
+  out.toList()
+}
+
+let replaceAt(text: String, needle: String, replacement: String, at: List<StringIndex>): String {
+  let needleLength = needle.countBetween(String.begin, needle.end);
+  let sb = new StringBuilder();
+  var cursor = String.begin;
+  for (let p of at) {
+    sb.appendBetween(text, cursor, p);
+    sb.append(replacement);
+    cursor = text.step(p, needleLength);
+  }
+  sb.appendBetween(text, cursor, text.end);
+  sb.toString()
+}
+
+// String helpers the tests also use. They are library code so every
+// backend's test class can reach them (see the note in repair_test.temper).
+let contains(text: String, needle: String): Boolean {
+  text.indexOf(needle, String.begin) is StringIndex
+}
+
+let endsWith(text: String, suffix: String): Boolean {
+  let n = suffix.countBetween(String.begin, suffix.end);
+  if (!text.hasAtLeast(String.begin, text.end, n)) { return false; }
+  var i = text.end;
+  var k = 0;
+  while (k < n) { i = text.prev(i); k += 1; }
+  text.slice(i, text.end) == suffix
+}
+
+// The first n code points of s, escaped as Elixir's inspect/1 prints a
+// string (minus the surrounding quotes), because that is how Jam Pilot
+// quoted the find in "edit N (find "..."): ..." and the model was tuned
+// on that turn: inspect(String.slice(find, 0, 80)). No "..." suffix.
+let quoted(s: String, n: Int): String {
+  let sb = new StringBuilder();
+  var i = String.begin;
+  var count = 0;
+  while (s.hasIndex(i) && count < n) {
+    let c = s[i];
+    if (c == 92) {                  // backslash
+      sb.append("\\\\");
+    } else if (c == 34) {           // double quote
+      sb.append("\\\"");
+    } else if (c == 10) {           // newline
+      sb.append("\\n");
+    } else if (c == 9) {            // tab
+      sb.append("\\t");
+    } else if (c == 13) {           // carriage return
+      sb.append("\\r");
+    } else if (c == char'#' && count + 1 < n && s.hasIndex(s.next(i)) && s[s.next(i)] == char'{') {
+      // inspect escapes an interpolation opener; only when the "{" is
+      // inside the slice too, as it was sliced before it was inspected
+      sb.append("\\#");
+    } else {
+      sb.appendBetween(s, i, s.next(i));
+    }
+    count += 1;
+    i = s.next(i);
+  }
+  sb.toString()
+}
+
+let lastIndexOfBefore(text: String, needle: String, limit: StringIndex): StringIndexOption {
+  var best: StringIndexOption = text.indexOf(needle, limit); // NoStringIndex unless needle sits at limit
+  var from = String.begin;
+  var searching = true;
+  while (searching) {
+    let found = text.indexOf(needle, from);
+    when (found) {
+      is StringIndex -> if (found < limit) {
+        best = found;
+        from = text.next(found);
+      } else {
+        searching = false;
+      };
+      else -> do { searching = false; };
+    }
+  }
+  best
+}

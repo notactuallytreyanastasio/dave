@@ -1,0 +1,174 @@
+// The model's reply to the composer: a `Summary:` line and the whole song
+// in a ``` fence.
+//
+// Ported from Jam Pilot's `Dave.Compose.parse_reply` (notedance_viewer,
+// lib/dave/compose.ex), which is two PCRE regexes:
+//
+//     ~r/```[a-zA-Z]*[ \t]*\r?\n(.*?)\r?\n?```/s        the fence
+//     ~r/^\s*summary:\s*(.+?)\s*$/im                     the summary line
+//
+// Temper's std/regex has reluctant repeats but no flags (no /s, /i, /m),
+// so the two are scanned by hand here, with their backtracking semantics
+// written out where it shows:
+//   - the fence opens at the first ``` that is followed by letters, spaces
+//     or tabs and a line break (a ``` inline in prose is skipped), and
+//     closes at the next ``` after that; a line break just before the
+//     closing fence is not part of the song.
+//   - the summary is the first `summary:` (any case) with only whitespace
+//     between it and the start of its line; `\s*` crosses line breaks, so
+//     the text after the colon is the rest of the first line that has any,
+//     trimmed. `summary:` followed by nothing but whitespace to the end of
+//     the reply captures its last blank, as the regex did.
+//   - String.trim strips Unicode White_Space on both ends.
+// `\s` is PCRE's: space, tab, line feed, vertical tab, form feed, return.
+
+let { Problems } = import("../chat");
+let { Proposal } = import("../rounds");
+
+export let noScore = "The reply has no score: it must be a Summary: line and then the whole score inside a ``` fence.";
+export let emptyFence = "The fence in the reply is empty.";
+
+// The reply as a proposal: the song (trimmed, with one line break after
+// it) as the text, the summary line or "". The sentence for the model is
+// on `problems` when the reply is not one.
+export let parseReply(reply: String, problems: Problems): Proposal throws Bubble {
+  let score = fenceBody(reply);
+  if (score == null) {
+    problems.note(noScore);
+    bubble();
+  }
+  let trimmed = trim(score ?? "");
+  if (trimmed.isEmpty) {
+    problems.note(emptyFence);
+    bubble();
+  }
+  new Proposal(summaryLine(reply), [], "${trimmed}\n")
+}
+
+// ---------- the fence ----------
+
+let fenceBody(reply: String): String? {
+  var from: StringIndexOption = reply.indexOf("```", String.begin);
+  var searching = true;
+  while (searching) {
+    // `from` is a var; only a `let` narrows in a `when`
+    let at = from;
+    when (at) {
+      is StringIndex -> do {
+        // the head: letters, then spaces or tabs, an optional return, a line feed
+        var i = reply.step(at, 3);
+        while (reply.hasIndex(i) && isAsciiLetter(reply[i])) { i = reply.next(i); }
+        while (reply.hasIndex(i) && (reply[i] == 32 || reply[i] == 9)) { i = reply.next(i); }
+        if (reply.hasIndex(i) && reply[i] == 13) { i = reply.next(i); }
+        if (reply.hasIndex(i) && reply[i] == 10) {
+          let start = reply.next(i);
+          let close = reply.indexOf("```", start);
+          when (close) {
+            is StringIndex -> do {
+              // `(.*?)\r?\n?` before the closing fence: the shortest body, so a
+              // return and line feed right before it belong to the fence
+              var end = close;
+              if (end > start && reply[reply.prev(end)] == 10) { end = reply.prev(end); }
+              if (end > start && reply[reply.prev(end)] == 13) { end = reply.prev(end); }
+              return reply.slice(start, end);
+            };
+            else -> do { return null; };
+          }
+        }
+        from = reply.indexOf("```", reply.next(at));
+      };
+      else -> do { searching = false; };
+    }
+  }
+  null
+}
+
+// ---------- the summary line ----------
+
+let summaryLine(reply: String): String {
+  let token = "summary:";
+  var found: StringIndex? = findCaseless(reply, token, String.begin);
+  while (found != null) {
+    let at = found;
+    if (at != null) {
+      if (atLineStart(reply, at)) {
+        let afterToken = reply.step(at, 8);
+        // `\s*` greedy, across line breaks
+        var r = afterToken;
+        while (reply.hasIndex(r) && isSpace(reply[r])) { r = reply.next(r); }
+        if (reply.hasIndex(r)) {
+          // `(.+?)\s*$`: the rest of this line, trimmed at the end
+          var e = r;
+          while (reply.hasIndex(e) && reply[e] != 10) { e = reply.next(e); }
+          var last = e;
+          while (last > r && isSpace(reply[reply.prev(last)])) { last = reply.prev(last); }
+          return reply.slice(r, last);
+        }
+        // only whitespace to the end: `\s*` gives back one character for
+        // `.+?`, the last one that is not a line feed
+        var back = reply.end;
+        while (back > afterToken) {
+          let c = reply[reply.prev(back)];
+          if (c != 10) { return reply.slice(reply.prev(back), back); }
+          back = reply.prev(back);
+        }
+      }
+      found = findCaseless(reply, token, reply.next(at));
+    }
+  }
+  ""
+}
+
+// `^\s*` before the token: nothing but whitespace back to a line start.
+let atLineStart(text: String, at: StringIndex): Boolean {
+  var j = at;
+  while (j > String.begin) {
+    j = text.prev(j);
+    let c = text[j];
+    if (c == 10) { return true; }
+    if (!isSpace(c)) { return false; }
+  }
+  true
+}
+
+// The first position at or after `from` where `needle` (lower-case ASCII)
+// matches ignoring ASCII case, as PCRE's /i does without /u.
+let findCaseless(text: String, needle: String, from: StringIndex): StringIndex? {
+  var at = from;
+  while (text.hasIndex(at)) {
+    var i = at;
+    var j = String.begin;
+    var same = true;
+    while (same && needle.hasIndex(j)) {
+      if (!text.hasIndex(i) || lowerAscii(text[i]) != needle[j]) {
+        same = false;
+      } else {
+        i = text.next(i);
+        j = needle.next(j);
+      }
+    }
+    if (same) { return at; }
+    at = text.next(at);
+  }
+  null
+}
+
+let lowerAscii(c: Int): Int { if (c >= char'A' && c <= char'Z') { c + 32 } else { c } }
+let isAsciiLetter(c: Int): Boolean { (c >= char'a' && c <= char'z') || (c >= char'A' && c <= char'Z') }
+// PCRE \s
+let isSpace(c: Int): Boolean { c == 32 || (c >= 9 && c <= 13) }
+
+// Unicode White_Space, which is what Elixir's String.trim/1 strips.
+let isUnicodeSpace(c: Int): Boolean {
+  (c >= 9 && c <= 13) || c == 32 || c == 0x85 || c == 0xA0 || c == 0x1680 ||
+    (c >= 0x2000 && c <= 0x200A) || c == 0x2028 || c == 0x2029 || c == 0x202F || c == 0x205F || c == 0x3000
+}
+
+// Elixir's String.trim/1.
+export let trim(s: String): String {
+  var a = String.begin;
+  while (s.hasIndex(a) && isUnicodeSpace(s[a])) { a = s.next(a); }
+  var b = s.end;
+  while (b > a && isUnicodeSpace(s[s.prev(b)])) { b = s.prev(b); }
+  s.slice(a, b)
+}

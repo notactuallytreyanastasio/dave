@@ -1,0 +1,180 @@
+// Tests for StreamAssembler: the frames Fireworks/GLM send, as Jam Pilot's
+// parse_sse test (notedance_viewer, test/dave/hotfix/glm_test.exs) shaped
+// them, plus the cases that test did not cover: CRLF, several lines in one
+// frame, usage on the last chunk, a cut-off with partial content.
+//
+// Same scope rules as chat_test.temper: no std import here.
+
+// A chunk line as the provider writes it. finish null means no key at all.
+let chunkLine(delta: String, finish: String?): String {
+  let fr = if (finish == null) { "null" } else { "\"${finish}\"" };
+  "data: {\"id\":\"chatcmpl-s\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"accounts/fireworks/models/glm-4p6\",\"choices\":[{\"index\":0,\"delta\":{${delta}},\"finish_reason\":${fr}}]}\n"
+}
+
+let reasoning(text: String): String { chunkLine("\"reasoning_content\":\"${text}\"", null) }
+let contentChunk(text: String, finish: String?): String { chunkLine("\"content\":\"${text}\"", finish) }
+
+// Deltas rendered for comparison: R:text for reasoning, C:text for content.
+let render(deltas: List<Delta>): String {
+  deltas.join(" ") { d =>
+    when (d) {
+      is ReasoningDelta -> "R:${d.text}";
+      is ContentDelta -> "C:${d.text}";
+    }
+  }
+}
+
+let feedOrFail(test: Test, a: StreamAssembler, frame: String): List<Delta> {
+  a.feed(frame) orelse do {
+    assert(false) { "feed bubbled: ${a.lastError ?? "<no problem recorded>"}" }
+    []
+  }
+}
+
+// ---------- the Elixir test, ported ----------
+
+let runInOrder(test: Test): Void {
+  let a = new StreamAssembler();
+  let frame = "${reasoning("Count")}${reasoning(" bars.")}${contentChunk("Sum", null)}${contentChunk("mary", "stop")}data: [DONE]\n";
+  let deltas = feedOrFail(test, a, frame);
+  assert(render(deltas) == "R:Count R: bars. C:Sum C:mary") { render(deltas) }
+  assert(a.contentSoFar == "Summary") { a.contentSoFar }
+  assert(a.finishReason == "stop") { a.finishReason ?? "null" }
+  assert(a.pending == "") { "pending `${a.pending}`" }
+  let r = a.finish();
+  assert(r.text == "Summary") { r.text ?? "null" }
+  assert(r.finishReason == "stop");
+  assert(r.id == "chatcmpl-s");
+  assert(r.model == "accounts/fireworks/models/glm-4p6");
+  assert(r.created == 1700000000i64);
+  assert(r.usage == null) { "usage without a usage chunk" }
+  assert(r.choices.length == 1 && r.choices[0].index == 0);
+  assert(r.toolCalls.isEmpty);
+}
+test("reasoning then content deltas come out in order and join into one response") { test => runInOrder(test); }
+
+let runSplitLine(test: Test): Void {
+  let whole = contentChunk("abc", null);
+  // Cut 20 code points in, inside the JSON.
+  let cut = whole.step(String.begin, 20);
+  let first = whole.slice(String.begin, cut);
+  let second = whole.slice(cut, whole.end);
+  let a = new StreamAssembler();
+  let d1 = feedOrFail(test, a, first);
+  assert(d1.isEmpty) { render(d1) }
+  assert(a.pending == first) { "pending `${a.pending}`" }
+  assert(a.contentSoFar == "");
+  let d2 = feedOrFail(test, a, second);
+  assert(render(d2) == "C:abc") { render(d2) }
+  assert(a.pending == "") { "pending `${a.pending}`" }
+  assert(a.contentSoFar == "abc");
+}
+test("a line split across two frames waits in the buffer") { test => runSplitLine(test); }
+
+let runCutOffReasoningOnly(test: Test): Void {
+  let a = new StreamAssembler();
+  feedOrFail(test, a, chunkLine("\"reasoning_content\":\"x\"", "length"));
+  assert(a.finishReason == "length");
+  let r = a.finish();
+  assert(r.text == null) { "text should be null before any answer, got `${r.text ?? ""}`" }
+  assert(r.finishReason == FinishReasons.length);
+}
+test("a cut-off before any answer keeps finish_reason length and null content") { test => runCutOffReasoningOnly(test); }
+
+// ---------- the cases the Elixir test did not have ----------
+
+let runSeveralLinesOneFrame(test: Test): Void {
+  // Four lines, one frame, no trailing newline on the last: it waits.
+  let a = new StreamAssembler();
+  let frame = "${contentChunk("a", null)}${contentChunk("b", null)}${contentChunk("c", null)}data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"d\"}";
+  let d = feedOrFail(test, a, frame);
+  assert(render(d) == "C:a C:b C:c") { render(d) }
+  assert(a.pending == "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"d\"}") { a.pending }
+  let d2 = feedOrFail(test, a, "}]}\n");
+  assert(render(d2) == "C:d") { render(d2) }
+  assert(a.contentSoFar == "abcd");
+}
+test("a frame holding several lines yields each, the unfinished one waits") { test => runSeveralLinesOneFrame(test); }
+
+let runCrlf(test: Test): Void {
+  let a = new StreamAssembler();
+  let frame = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"one\"}}]}\r\ndata: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\" two\"},\"finish_reason\":\"stop\"}]}\r\ndata: [DONE]\r\n";
+  let d = feedOrFail(test, a, frame);
+  assert(render(d) == "C:one C: two") { render(d) }
+  assert(a.finishReason == "stop");
+  assert(a.pending == "") { "pending `${a.pending}`" }
+  // A CRLF split between frames: the "\r" lands at the end of one line.
+  let b = new StreamAssembler();
+  feedOrFail(test, b, "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"x\"}}]}\r");
+  assert(b.contentSoFar == "") { "a line is not complete until its \\n" }
+  let d2 = feedOrFail(test, b, "\n");
+  assert(render(d2) == "C:x") { render(d2) }
+}
+test("CRLF line ends are the same lines") { test => runCrlf(test); }
+
+let runCutOffWithContent(test: Test): Void {
+  let a = new StreamAssembler();
+  feedOrFail(test, a, "${reasoning("think")}${contentChunk("{\\\"summary\\\": \\\"half", null)}${chunkLine("", "length")}");
+  let r = a.finish();
+  assert(r.text == "{\"summary\": \"half") { r.text ?? "null" }
+  assert(r.finishReason == FinishReasons.length) { r.finishReason ?? "null" }
+  // The same shape a whole reply gives: re-encoded, it decodes back.
+  let problems = new Problems();
+  let again = parseChatResponse(r.toJsonText() orelse "<encode failed>", problems) orelse panic();
+  assert(problems.isEmpty) { problems.summary() }
+  assert(again.text == r.text && again.finishReason == r.finishReason);
+}
+test("a cut-off with partial content keeps the content and finish_reason length") { test => runCutOffWithContent(test); }
+
+let runUsageOnLastChunk(test: Test): Void {
+  let a = new StreamAssembler();
+  // Fireworks with stream_options.include_usage: the final chunk has an
+  // empty choices array and the usage.
+  let frame = "${contentChunk("ok", "stop")}data: {\"id\":\"chatcmpl-s\",\"object\":\"chat.completion.chunk\",\"model\":\"accounts/fireworks/models/glm-4p6\",\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":250,\"total_tokens\":261,\"completion_tokens_details\":{\"reasoning_tokens\":240}}}\ndata: [DONE]\n";
+  let d = feedOrFail(test, a, frame);
+  assert(render(d) == "C:ok") { render(d) }
+  let u = a.usage;
+  if (u == null) { assert(false) { "usage not kept" } } else {
+    assert(u.promptTokens == 11 && u.completionTokens == 250 && u.totalTokens == 261);
+    assert(u.reasoningTokens == 240) { "reasoning ${u.reasoningTokens ?? -1}" }
+  }
+  let r = a.finish();
+  let ru = r.usage;
+  if (ru == null) { assert(false) { "usage not on the response" } } else {
+    assert(ru.reasoningTokens == 240);
+  }
+  assert((r.toJsonText() orelse "?") == "{\"id\":\"chatcmpl-s\",\"object\":\"chat.completion\",\"created\":1700000000,\"model\":\"accounts/fireworks/models/glm-4p6\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"ok\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":250,\"total_tokens\":261,\"completion_tokens_details\":{\"reasoning_tokens\":240}}}") { r.toJsonText() orelse "?" }
+}
+test("usage on the last chunk is kept and lands on the response") { test => runUsageOnLastChunk(test); }
+
+let runIgnoredLines(test: Test): Void {
+  let a = new StreamAssembler();
+  let frame = ": keep-alive\nevent: message\n\ndata: not json at all\ndata:\n${contentChunk("hi", null)}data: [DONE]\n\n";
+  let d = feedOrFail(test, a, frame);
+  assert(render(d) == "C:hi") { render(d) }
+  assert(a.lastError == null) { a.lastError ?? "" }
+}
+test("comments, event lines, blank lines and non-JSON data are ignored") { test => runIgnoredLines(test); }
+
+let runMalformedChunk(test: Test): Void {
+  // A streamed tool call is not assembled yet: loud, not dropped.
+  let a = new StreamAssembler();
+  let d: List<Delta>? = a.feed("data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c\",\"function\":{\"name\":\"f\",\"arguments\":\"\"}}]}}]}\n") orelse null;
+  assert(d == null) { "a tool_calls delta was accepted" }
+  assert(a.lastError == "$.choices[0].delta.tool_calls: streamed tool calls are not assembled yet") { a.lastError ?? "" }
+  // The failed line is consumed, not left in the buffer.
+  assert(a.pending == "") { a.pending }
+
+  // An error object in the stream.
+  let b = new StreamAssembler();
+  let e: List<Delta>? = b.feed("data: {\"error\":{\"message\":\"model overloaded\",\"type\":\"server_error\"}}\n") orelse null;
+  assert(e == null) { "an error chunk was accepted" }
+  assert(b.lastError == "$.error: model overloaded (server_error)") { b.lastError ?? "" }
+
+  // A content that is not a string.
+  let c = new StreamAssembler();
+  let f: List<Delta>? = c.feed("data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":5}}]}\n") orelse null;
+  assert(f == null) { "a numeric content was accepted" }
+  assert(c.lastError == "$.choices[0].delta.content: expected string, got number") { c.lastError ?? "" }
+}
+test("a chunk this library cannot read bubbles with its JSON path") { test => runMalformedChunk(test); }

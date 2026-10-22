@@ -1,0 +1,195 @@
+// Diagnostics for decoding and validation.
+//
+// Temper's Bubble carries no message. So a decoder that cannot accept its
+// input records why on a Problems object ("<json path>: <why>") and then
+// bubbles; the caller reads `problems.messages`. Nothing is defaulted
+// silently: an unknown role, a number where a string was promised, a
+// missing required field all end the decode with a path and a reason.
+
+let {
+  InterchangeContext,
+  JsonSyntaxTree, JsonObject, JsonArray, JsonString, JsonBoolean, JsonNull, JsonNumeric,
+  JsonProducer, JsonTextProducer,
+} = import("std/json");
+
+export class Problems {
+  private items: ListBuilder<String> = new ListBuilder<String>();
+
+  public get isEmpty(): Boolean { items.isEmpty }
+  public get count(): Int { items.length }
+  public get messages(): List<String> { items.toList() }
+  public get first(): String? { if (items.isEmpty) { null } else { items[0] } }
+  public get last(): String? { if (items.isEmpty) { null } else { items[items.length - 1] } }
+
+  public add(path: String, why: String): Void { items.add("${path}: ${why}"); }
+  // A sentence with no path, kept exactly as given. For messages that go
+  // back to a model or a person as they are (the repair loop's), where a
+  // "reply: " prefix would change the turn the model was tuned against.
+  public note(why: String): Void { items.add(why); }
+  public clear(): Void { items.clear(); }
+  public summary(): String { items.join("; ") { it => it } }
+}
+
+// The standard adapter signature is decodeFromJson(tree, context). An
+// InterchangeContext is an interface, so this one carries the Problems and
+// hosts that already use std/json adapters get diagnostics for free.
+export class DecodeContext(public problems: Problems) extends InterchangeContext {
+  public getHeader(headerName: String): String? { null }
+}
+
+let problemsOf(ic: InterchangeContext): Problems {
+  when (ic) {
+    is DecodeContext -> ic.problems;
+    else -> new Problems();
+  }
+}
+
+// What a JSON value is, for messages like "expected string, got number".
+let kindOf(t: JsonSyntaxTree?): String {
+  when (t) {
+    is JsonObject -> "object";
+    is JsonArray -> "array";
+    is JsonString -> "string";
+    is JsonBoolean -> "boolean";
+    is JsonNull -> "null";
+    is JsonNumeric -> "number";
+    else -> if (t == null) { "absent" } else { "value" };
+  }
+}
+
+// A JSON object with a path, for reading typed fields. Absent and `null`
+// are the same thing to the *OrNull readers, because the OpenAI format
+// omits fields rather than sending null and clients must accept both.
+class Obj(
+  public tree: JsonObject,
+  public path: String,
+  public problems: Problems,
+) {
+  public static at(t: JsonSyntaxTree?, path: String, problems: Problems): Obj throws Bubble {
+    when (t) {
+      is JsonObject -> new Obj(t, path, problems);
+      else -> do { problems.add(path, "expected object, got ${kindOf(t)}"); bubble() }
+    }
+  }
+
+  public child(key: String): String { "${path}.${key}" }
+
+  // The value under key, or null when absent or JSON null.
+  public raw(key: String): JsonSyntaxTree? {
+    let v = tree.propertyValueOrNull(key);
+    if (v == null || v is JsonNull) { null } else { v }
+  }
+
+  public has(key: String): Boolean { raw(key) != null }
+
+  public fail(key: String, why: String): Void throws Bubble {
+    problems.add(child(key), why);
+    bubble()
+  }
+
+  public string(key: String): String throws Bubble {
+    let v = raw(key);
+    when (v) {
+      is JsonString -> v.content;
+      else -> do { fail(key, "expected string, got ${kindOf(v)}"); bubble() }
+    }
+  }
+
+  public stringOrNull(key: String): String? throws Bubble {
+    let v = raw(key);
+    when (v) {
+      is JsonString -> v.content;
+      else -> if (v == null) { null } else { do { fail(key, "expected string, got ${kindOf(v)}"); bubble() } };
+    }
+  }
+
+  public int(key: String): Int throws Bubble {
+    let v = raw(key);
+    when (v) {
+      is JsonNumeric -> v.asInt32() orelse do { fail(key, "expected a 32-bit integer, got ${v.asJsonNumericToken()}"); bubble() };
+      else -> do { fail(key, "expected number, got ${kindOf(v)}"); bubble() }
+    }
+  }
+
+  public intOrNull(key: String): Int? throws Bubble {
+    if (has(key)) { int(key) } else { null }
+  }
+
+  public int64OrNull(key: String): Int64? throws Bubble {
+    let v = raw(key);
+    when (v) {
+      is JsonNumeric -> v.asInt64() orelse do { fail(key, "expected an integer, got ${v.asJsonNumericToken()}"); bubble() };
+      else -> if (v == null) { null } else { do { fail(key, "expected number, got ${kindOf(v)}"); bubble() } };
+    }
+  }
+
+  public float64OrNull(key: String): Float64? throws Bubble {
+    let v = raw(key);
+    when (v) {
+      is JsonNumeric -> v.asFloat64() orelse do { fail(key, "expected a number, got ${v.asJsonNumericToken()}"); bubble() };
+      else -> if (v == null) { null } else { do { fail(key, "expected number, got ${kindOf(v)}"); bubble() } };
+    }
+  }
+
+  public booleanOrNull(key: String): Boolean? throws Bubble {
+    let v = raw(key);
+    when (v) {
+      is JsonBoolean -> v.content;
+      else -> if (v == null) { null } else { do { fail(key, "expected boolean, got ${kindOf(v)}"); bubble() } };
+    }
+  }
+
+  public obj(key: String): Obj throws Bubble {
+    Obj.at(raw(key), child(key), problems)
+  }
+
+  public objOrNull(key: String): Obj? throws Bubble {
+    if (has(key)) { obj(key) } else { null }
+  }
+
+  public list(key: String): List<JsonSyntaxTree> throws Bubble {
+    let v = raw(key);
+    when (v) {
+      is JsonArray -> v.elements;
+      else -> do { fail(key, "expected array, got ${kindOf(v)}"); bubble() }
+    }
+  }
+
+  // Absent, null and [] are all the empty list.
+  public listOrEmpty(key: String): List<JsonSyntaxTree> throws Bubble {
+    if (has(key)) { list(key) } else { [] }
+  }
+}
+
+let arrayAt(t: JsonSyntaxTree?, path: String, problems: Problems): List<JsonSyntaxTree> throws Bubble {
+  when (t) {
+    is JsonArray -> t.elements;
+    else -> do { problems.add(path, "expected array, got ${kindOf(t)}"); bubble() }
+  }
+}
+
+// Run an encoder and return the text. toJsonString can fail on an
+// unbalanced producer, which would be a bug in the encoder, not in the input.
+let jsonText(write: fn (JsonProducer): Void): String throws Bubble {
+  let p = new JsonTextProducer();
+  write(p);
+  p.toJsonString()
+}
+
+// Write "key": value for an optional string, skipping it when null, which
+// is how the OpenAI format spells "not set".
+let keyStringOrSkip(p: JsonProducer, key: String, value: String?): Void {
+  if (value != null) { p.objectKey(key); p.stringValue(value); }
+}
+
+let keyIntOrSkip(p: JsonProducer, key: String, value: Int?): Void {
+  if (value != null) { p.objectKey(key); p.int32Value(value); }
+}
+
+let keyFloatOrSkip(p: JsonProducer, key: String, value: Float64?): Void {
+  if (value != null) { p.objectKey(key); p.float64Value(value); }
+}
+
+let keyBooleanOrSkip(p: JsonProducer, key: String, value: Boolean?): Void {
+  if (value != null) { p.objectKey(key); p.booleanValue(value); }
+}

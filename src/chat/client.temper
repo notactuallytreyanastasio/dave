@@ -1,0 +1,83 @@
+// The network boundary.
+//
+// Temper code never opens a socket. The host implements Transport in its
+// own language (fetch, requests, reqwest, HttpClient...) and hands it in;
+// this file only decides what to send and what the answer means. That is
+// the whole reason the library can be one source for six languages.
+
+export class HttpRequest(
+  public method: String,
+  public url: String,
+  public headers: Map<String, String>,
+  public body: String? = null,
+) {}
+
+export class HttpResponse(
+  public status: Int,
+  public body: String,
+  public headers: Map<String, String> = new Map<String, String>([]),
+) {}
+
+export interface Transport {
+  // Bubbles only when no HTTP response was obtained at all (DNS, refused,
+  // timeout). A 4xx or 5xx is a response and comes back as one.
+  public send(request: HttpRequest): HttpResponse throws Bubble;
+}
+
+export class ChatClient(
+  public transport: Transport,
+  public baseUrl: String = "https://api.openai.com/v1",
+  public apiKey: String? = null,
+  public extraHeaders: Map<String, String> = new Map<String, String>([]),
+) {
+  private problems: Problems = new Problems();
+
+  // Why the last call failed, as "<where>: <why>" lines; empty after success.
+  public get lastProblems(): List<String> { problems.messages }
+  public get lastError(): String? { problems.first }
+
+  public get completionsUrl(): String {
+    let end = baseUrl.end;
+    let trimmed = if (!baseUrl.isEmpty && baseUrl[baseUrl.prev(end)] == char'/') {
+      baseUrl.slice(String.begin, baseUrl.prev(end))
+    } else {
+      baseUrl
+    };
+    "${trimmed}/chat/completions"
+  }
+
+  // Validates and encodes. A request with problems never leaves the host.
+  public buildRequest(request: ChatRequest): HttpRequest throws Bubble {
+    problems.clear();
+    let invalid = request.validate();
+    if (!invalid.isEmpty) {
+      for (let why of invalid) { problems.add("request", why); }
+      bubble();
+    }
+    let headers = new MapBuilder<String, String>();
+    headers["Content-Type"] = "application/json";
+    let key = apiKey;
+    if (key != null) { headers["Authorization"] = "Bearer ${key}"; }
+    extraHeaders.forEach { k: String, v: String => headers[k] = v; }
+    let body = request.toJsonText() orelse do {
+      problems.add("request", "encoder produced unbalanced JSON");
+      bubble()
+    };
+    new HttpRequest("POST", completionsUrl, headers.toMap(), body)
+  }
+
+  public complete(request: ChatRequest): ChatResponse throws Bubble {
+    let http = buildRequest(request);
+    let response = transport.send(http) orelse do {
+      problems.add("transport", "no response from ${http.url}");
+      bubble()
+    };
+    if (response.status < 200 || response.status >= 300) {
+      let apiError = parseApiError(response.body);
+      let detail = if (apiError == null) { "" } else { ": ${apiError.describe()}" };
+      problems.add("http", "status ${response.status}${detail}");
+      bubble();
+    }
+    parseChatResponse(response.body, problems)
+  }
+}

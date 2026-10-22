@@ -1,0 +1,8 @@
+// Test file with no std import. The module's files share one scope, so
+// lib.temper's binding of parseJson is visible, and js imports it.
+
+let run(test: Test): Void {
+  let t = parseJson("{\"a\":1}") orelse panic();
+  assert(isObject(t)) { "not an object" }
+}
+test("once: test file relies on the library file's import") { test => run(test); }
